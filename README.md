@@ -1,142 +1,144 @@
-# Ham — Cloudflare Worker Control Panel
+# پنل مدیریت (Ham) — ورکر Cloudflare
 
-**Ham** is a single-file, self-hosted control panel that runs entirely as a **Cloudflare Worker**. It ships with a built-in admin dashboard, user/role management, a **VLESS + Trojan (WebSocket + TLS)** proxy tunnel served directly from the Worker, subscription-link generation, Cloudflare DNS/zone management, cache purging, Telegram notifications, and D1-backed persistence — all in one `.js` file with no build step and no external server required.
+**هَم (Ham)** یک پنل مدیریت تک‌فایلی است که به‌طور کامل روی **Cloudflare Worker** اجرا می‌شود. این پروژه شامل داشبورد مدیریت داخلی، مدیریت کاربران و نقش‌ها، تونل پروکسی **VLESS و Trojan (روی WebSocket + TLS)** که مستقیماً از خود ورکر سرو می‌شود، تولید لینک اشتراک (Subscription)، مدیریت DNS و زون‌های Cloudflare، پاکسازی کش (Purge)، اطلاع‌رسانی از طریق تلگرام، و ذخیره‌سازی داده روی D1 است — همه در یک فایل `.js` بدون نیاز به فرآیند Build یا سرور جداگانه.
 
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Requirements](#requirements)
-- [Deployment](#deployment)
-- [First-Run Setup Wizard](#first-run-setup-wizard)
-- [Using the Panel](#using-the-panel)
-- [Data Model (D1 Schema)](#data-model-d1-schema)
-- [Security Notes](#security-notes)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
 
 ---
 
-## Features
+## فهرست مطالب
 
-- **Zero-install deployment** — one JavaScript file, pasted directly into the Cloudflare dashboard, no bundler/CLI required.
-- **Built-in admin UI** — a full single-page app (HTML/CSS/JS) is served by the Worker itself; no separate frontend hosting needed.
-- **Authentication & authorization**
-  - Username/password login with PBKDF2 (SHA-256, 100k iterations) password hashing.
-  - Session cookies (`HttpOnly`, `SameSite=Lax`, secure on HTTPS).
-  - Optional two-factor login flow.
-  - Role-based users (e.g. admin/viewer), user activation toggle, per-user audit trail.
-  - Login rate limiting per IP.
-- **VPN / proxy engine**
-  - VLESS and Trojan protocols over WebSocket, tunneled through `cloudflare:sockets`.
-  - Per-peer UUID/password, quota (bytes), expiry date, max concurrent IPs, port, fragmentation and mux options.
-  - Configurable WebSocket path (default `/vpnws`).
-  - Traffic accounting (used bytes vs. quota) and daily traffic stats.
-  - Automatic link generation (`vless://…`, `trojan://…`) and Clash/subscription-compatible output.
-- **Subscription links**
-  - Shareable subscription tokens (per-client), each with its own protocols, ports, quota, expiry, branding/logo, and optional single-use ("one-shot") mode.
-  - Base64 and Clash/YAML subscription formats.
-- **Cloudflare integration**
-  - Manage zones, DNS records (create/update/delete), and purge cache — directly from the panel using a Cloudflare API token.
-- **Operations**
-  - JSON backup/restore of the full configuration (users, VPN peers, subscriptions, settings).
-  - Audit log of admin actions, with IP and timestamp.
-  - Telegram bot integration for notifications (e.g. login alerts, quota/expiry alerts) and optional Telegram-based 2FA.
-  - Scheduled (cron) task support for periodic maintenance (traffic aggregation, expiry checks, alerts).
-  - Configurable panel name, language (English/Persian UI), and custom admin path ("camouflage" URL) to hide the login page behind an arbitrary path.
-- **Bilingual UI** — interface strings are available in **English** and **Persian (فارسی)**, switchable from settings.
+- [امکانات](#امکانات)
+- [پیش‌نیازها](#پیش‌نیازها)
+- [نصب و راه‌اندازی](#نصب-و-راه‌اندازی)
+- [ویزارد راه‌اندازی اولیه](#ویزارد-راه‌اندازی-اولیه)
+- [استفاده از پنل](#استفاده-از-پنل)
+- [ساختار داده (اسکیمای D1)](#ساختار-داده-اسکیمای-d1)
+- [نکات امنیتی](#نکات-امنیتی)
+- [رفع اشکال](#رفع-اشکال)
+- [مجوز](#مجوز)
 
-## Requirements
+---
 
-- A **Cloudflare account** with Workers enabled.
-- A **Cloudflare D1 database** (free tier is sufficient to start).
-- Worker **Compatibility Date** set to `2024-09-01` or later (required for `cloudflare:sockets`).
-- (Optional) A Cloudflare **API Token** with Zone/DNS/Cache permissions, if you want to use the DNS and cache-purge features.
-- (Optional) A **Telegram bot token** and chat ID, if you want Telegram notifications/2FA.
+## امکانات
 
-## Deployment
+- **نصب بدون هیچ ابزار جانبی** — فقط یک فایل جاوااسکریپت که مستقیماً در داشبورد Cloudflare پیست می‌شود؛ بدون نیاز به Bundler یا CLI.
+- **رابط کاربری مدیریت داخلی** — یک اپلیکیشن تک‌صفحه‌ای کامل (HTML/CSS/JS) که خود ورکر آن را سرو می‌کند؛ نیازی به هاست جداگانه برای فرانت‌اند نیست.
+- **احراز هویت و سطح دسترسی**
+  - ورود با نام‌کاربری/رمز عبور با هش PBKDF2 (SHA-256، ۱۰۰٬۰۰۰ تکرار).
+  - کوکی نشست امن (`HttpOnly`، `SameSite=Lax`، و `Secure` روی HTTPS).
+  - امکان ورود دومرحله‌ای (2FA).
+  - کاربران با نقش (مثلاً مدیر/بازدیدکننده)، فعال/غیرفعال‌سازی کاربر، و ثبت رخدادها به ازای هر کاربر.
+  - محدودسازی تعداد تلاش ورود بر اساس IP.
+- **موتور VPN / پروکسی**
+  - پروتکل‌های VLESS و Trojan روی WebSocket، از طریق `cloudflare:sockets` تونل‌زنی می‌شوند.
+  - برای هر کاربر (peer): UUID/پسورد اختصاصی، سقف مصرف (حجم)، تاریخ انقضا، حداکثر تعداد IP همزمان، پورت، و گزینه‌های Fragment و Mux.
+  - مسیر WebSocket قابل تنظیم (پیش‌فرض `/vpnws`).
+  - محاسبه مصرف ترافیک (مصرف‌شده در برابر سقف) و آمار روزانه ترافیک.
+  - تولید خودکار لینک‌های اتصال (`vless://…`، `trojan://…`) و خروجی سازگار با Clash/ساب.
+- **لینک‌های اشتراک (Subscription)**
+  - لینک‌های اشتراک قابل اشتراک‌گذاری برای هر مشتری، هرکدام با پروتکل‌ها، پورت‌ها، سقف مصرف، انقضا، برندینگ/لوگوی اختصاصی، و حالت اختیاری «یک‌بارمصرف».
+  - خروجی به فرمت Base64 و Clash/YAML.
+- **یکپارچگی با Cloudflare**
+  - مدیریت زون‌ها، رکوردهای DNS (ایجاد/ویرایش/حذف)، و پاکسازی کش — مستقیماً از داخل پنل با استفاده از API Token کلادفلر.
+- **عملیات و نگهداری**
+  - پشتیبان‌گیری/بازیابی کامل پیکربندی (کاربران، سرویس‌های VPN، اشتراک‌ها، تنظیمات) به فرمت JSON.
+  - لاگ رخدادهای مدیریتی همراه با IP و زمان.
+  - یکپارچگی با ربات تلگرام برای اطلاع‌رسانی (مثلاً هشدار ورود، هشدار اتمام حجم/انقضا) و امکان 2FA از طریق تلگرام.
+  - پشتیبانی از وظایف زمان‌بندی‌شده (Cron) برای نگهداری دوره‌ای (جمع‌بندی ترافیک، بررسی انقضا، هشدارها).
+  - نام پنل، زبان رابط کاربری (فارسی/انگلیسی)، و مسیر مدیریتی سفارشی («استتار» آدرس لاگین) قابل تنظیم است.
+- **رابط کاربری دوزبانه** — تمام متن‌های رابط کاربری به **انگلیسی** و **فارسی** موجود است و از تنظیمات قابل تغییر است.
 
-1. **Create a D1 database**
-   - Cloudflare Dashboard → **Workers & Pages** → **D1** → **Create database**.
-   - Give it any name (e.g. `ham-db`).
+## پیش‌نیازها
 
-2. **Create the Worker**
-   - Cloudflare Dashboard → **Workers & Pages** → **Create** → **Create Worker**.
-   - Open the Worker's editor, delete the default code, and paste the entire contents of `ham.js`.
+- یک **حساب Cloudflare** با فعال بودن Workers.
+- یک **دیتابیس D1** در Cloudflare (پلن رایگان برای شروع کافی است).
+- تنظیم **Compatibility Date** ورکر روی `2024-09-01` یا جدیدتر (لازم برای استفاده از `cloudflare:sockets`).
+- (اختیاری) یک **API Token** کلادفلر با دسترسی‌های Zone/DNS/Cache، در صورت نیاز به مدیریت DNS و پاکسازی کش.
+- (اختیاری) **توکن ربات تلگرام** و شناسه چت، در صورت نیاز به اطلاع‌رسانی/2FA تلگرامی.
 
-3. **Bind the D1 database**
-   - In the Worker: **Settings → Bindings → Add → D1 Database**.
-   - Set the **Variable name** to exactly: **`DB`**
-   - Select the database you created in step 1.
-   - ⚠️ If `DB` is not bound, the setup wizard will refuse to proceed.
+## نصب و راه‌اندازی
 
-4. **Set the Compatibility Date**
-   - **Settings → Compatibility Date** → set to `2026-09-01` or a later date.
-   - This is required so the `cloudflare:sockets` API (used for the VLESS/Trojan tunnel) is available.
+۱. **ساخت دیتابیس D1**
+   - داشبورد کلادفلر → **Workers & Pages** → **D1** → **Create database**.
+   - یک نام دلخواه برای آن انتخاب کنید (مثلاً `ham-db`).
 
-5. **Deploy**
-   - Click **Save and Deploy**.
-   - The tunnel (VLESS+WS+TLS) runs on the Worker itself — no separate API token is required for the proxy to function.
+۲. **ساخت ورکر**
+   - داشبورد کلادفلر → **Workers & Pages** → **Create** → **Create Worker**.
+   - وارد ادیتور ورکر شوید، کد پیش‌فرض را پاک کنید، و کل محتوای فایل `ham.js` را پیست کنید.
 
-6. Open your Worker's URL in a browser to start the setup wizard.
+۳. **اتصال دیتابیس D1 (Binding)**
+   - در ورکر: **Settings → Bindings → Add → D1 Database**.
+   - نام متغیر (Variable name) را دقیقاً روی **`DB`** بگذارید.
+   - دیتابیسی که در مرحله ۱ ساختید را انتخاب کنید.
+   - ⚠️ اگر `DB` وصل نباشد، ویزارد راه‌اندازی اجازه‌ی ادامه نمی‌دهد.
 
-## First-Run Setup Wizard
+۴. **تنظیم Compatibility Date**
+   - **Settings → Compatibility Date** → روی `2026-09-01` یا تاریخ جدیدتر تنظیم کنید.
+   - این تنظیم برای در دسترس بودن API مربوط به `cloudflare:sockets` (که تونل VLESS/Trojan از آن استفاده می‌کند) لازم است.
 
-On first visit, Ham detects that no admin account exists and walks you through setup:
+۵. **دیپلوی**
+   - روی **Save and Deploy** کلیک کنید.
+   - تونل (VLESS+WS+TLS) روی خودِ ورکر اجرا می‌شود — برای کارکرد پروکسی نیازی به API Token جداگانه نیست.
 
-1. **Create the admin account** — choose a username and a strong password (live strength hint shown in the UI), optional email.
-2. **(Optional) Cloudflare API token** — paste a token to enable DNS management and cache purging from the panel.
-3. **(Optional) Telegram bot token & chat ID** — enable notifications/alerts.
-4. Submit — the database schema is created automatically (`meta`, `users`, `sessions`, `settings`, `audit_logs`, `login_attempts`, `vpn_peers`, `vpn_subs`, `vpn_daily`, `vpn_ips`) and you're logged in.
+۶. آدرس ورکر خود را در مرورگر وارد کنید و سپس پس از آن /dash وارد کنید تا ویزارد راه‌اندازی اجرا شود.
+   - مثال: ham.workers.dev/dash
 
-After setup, you can revisit **Settings** at any time to change the panel name, UI language, VPN WebSocket path, admin panel path, Cloudflare token, Telegram credentials, and proxy IP list.
+## ویزارد راه‌اندازی اولیه
 
-## Using the Panel
+در اولین بازدید، Ham تشخیص می‌دهد که هنوز حساب مدیر ساخته نشده و شما را در این مراحل راهنمایی می‌کند:
 
-- **Dashboard** — overview of users, VPN peers/subscriptions, and traffic.
-- **VPN Peers** — add/edit/remove individual VLESS/Trojan clients (quota, expiry, max IPs, port, fragment/mux, location label). Each peer gets ready-to-use connection links.
-- **Subscriptions** — generate a single link that bundles multiple protocols/ports for a client, with its own quota/expiry/branding, and optional one-shot (single-view) links.
-- **DNS / Zones** — pick a Cloudflare zone, view/add/delete DNS records, and purge cache (single URLs or entire zone) — requires a Cloudflare API token with the right permissions.
-- **Users** — create additional admin/viewer accounts, change roles, deactivate accounts, reset passwords.
-- **Logs** — review the audit trail of actions taken in the panel.
-- **Backup/Restore** — export the full configuration as JSON, or import a previously exported backup file.
-- **Settings** — panel name, language, VPN path, camouflage/admin path, Cloudflare ports, Telegram integration, proxy IP allow-list.
+۱. **ساخت حساب مدیر** — انتخاب نام‌کاربری و رمز عبور قوی (نشانگر قدرت رمز به‌صورت زنده نمایش داده می‌شود)، ایمیل اختیاری.
+۲. **(اختیاری) API Token کلادفلر** — برای فعال‌سازی مدیریت DNS و پاکسازی کش از داخل پنل.
+۳. **(اختیاری) توکن ربات تلگرام و شناسه چت** — برای فعال‌سازی اطلاع‌رسانی/هشدارها.
+۴. ثبت — اسکیمای دیتابیس به‌طور خودکار ساخته می‌شود (`meta`، `users`، `sessions`، `settings`، `audit_logs`، `login_attempts`، `vpn_peers`، `vpn_subs`، `vpn_daily`، `vpn_ips`) و وارد پنل می‌شوید.
 
-## Data Model (D1 Schema)
+پس از راه‌اندازی، هر زمان می‌توانید از بخش **تنظیمات** نام پنل، زبان رابط کاربری، مسیر WebSocket سرویس VPN، مسیر پنل مدیریتی، توکن کلادفلر، اطلاعات تلگرام، و لیست IPهای پروکسی را تغییر دهید.
 
-The Worker automatically creates and migrates these tables on first run:
+## استفاده از پنل
 
-| Table | Purpose |
+- **داشبورد** — نمای کلی از کاربران، سرویس‌های VPN/اشتراک‌ها و ترافیک.
+- **سرویس‌های VPN (Peers)** — افزودن/ویرایش/حذف کاربران VLESS/Trojan (سقف مصرف، انقضا، حداکثر IP، پورت، Fragment/Mux، برچسب موقعیت). برای هر کاربر لینک اتصال آماده تولید می‌شود.
+- **اشتراک‌ها (Subscriptions)** — تولید یک لینک واحد که چند پروتکل/پورت را برای یک مشتری بسته‌بندی می‌کند، با سقف مصرف/انقضا/برندینگ اختصاصی و امکان لینک یک‌بارمصرف.
+- **DNS / زون‌ها** — انتخاب یک زون کلادفلر، مشاهده/افزودن/حذف رکوردهای DNS، و پاکسازی کش (یک URL خاص یا کل زون) — نیازمند API Token با دسترسی‌های مناسب.
+- **کاربران** — ساخت حساب‌های مدیر/بازدیدکننده جدید، تغییر نقش، غیرفعال‌سازی حساب، بازنشانی رمز عبور.
+- **لاگ‌ها** — مرور تاریخچه‌ی اقدامات انجام‌شده در پنل.
+- **پشتیبان‌گیری/بازیابی** — خروجی گرفتن از کل پیکربندی به‌صورت JSON، یا وارد کردن یک فایل پشتیبان قبلی.
+- **تنظیمات** — نام پنل، زبان، مسیر VPN، مسیر استتاری پنل، پورت‌های کلادفلر، یکپارچگی تلگرام، لیست مجاز IPهای پروکسی.
+
+## ساختار داده (اسکیمای D1)
+
+ورکر این جدول‌ها را به‌طور خودکار در اولین اجرا می‌سازد و مهاجرت می‌دهد:
+
+| جدول | کاربرد |
 |---|---|
-| `meta` | Internal key/value metadata |
-| `users` | Admin/viewer accounts (hashed passwords, roles, activity flag) |
-| `sessions` | Active login sessions (token, expiry, IP, user agent) |
-| `settings` | Panel-wide configuration (key/value) |
-| `audit_logs` | Action history for accountability |
-| `login_attempts` | Per-IP login rate limiting |
-| `vpn_peers` | Individual VPN client definitions and usage |
-| `vpn_subs` | Subscription links bundling multiple peers/protocols |
-| `vpn_daily` | Daily aggregated traffic counters |
-| `vpn_ips` | Recently seen IPs per peer/subscription (for max-IP enforcement) |
+| `meta` | متادیتای داخلی به‌صورت کلید/مقدار |
+| `users` | حساب‌های مدیر/بازدیدکننده (رمز هش‌شده، نقش، وضعیت فعال بودن) |
+| `sessions` | نشست‌های فعال ورود (توکن، انقضا، IP، مرورگر) |
+| `settings` | تنظیمات کلی پنل (کلید/مقدار) |
+| `audit_logs` | تاریخچه‌ی اقدامات برای پاسخگویی |
+| `login_attempts` | محدودسازی تلاش ورود بر اساس IP |
+| `vpn_peers` | تعریف و مصرف کاربران VPN به‌صورت جداگانه |
+| `vpn_subs` | لینک‌های اشتراک که چند کاربر/پروتکل را بسته‌بندی می‌کنند |
+| `vpn_daily` | شمارنده‌ی روزانه‌ی مجموع ترافیک |
+| `vpn_ips` | IPهای اخیراً مشاهده‌شده به ازای هر کاربر/اشتراک (برای اعمال محدودیت حداکثر IP) |
 
-## Security Notes
+## نکات امنیتی
 
-- Change the default admin panel path (camouflage URL) in Settings if you want to obscure the login page from casual scanning.
-- Passwords are hashed with PBKDF2-SHA256 (100,000 iterations) with a per-user salt; never store or share plaintext passwords.
-- Session cookies are `HttpOnly` and `Secure` (over HTTPS) — always deploy behind HTTPS (Cloudflare Workers do this by default).
-- The Cloudflare API token and Telegram bot token are stored in your D1 database — restrict dashboard/database access to trusted operators only.
-- Keep D1 backups (via the built-in Backup feature) somewhere safe, since they contain user records and VPN credentials.
+- در صورت تمایل به پنهان‌سازی صفحه‌ی ورود از اسکن‌های تصادفی، مسیر استتاری پنل مدیریت را از بخش تنظیمات تغییر دهید.
+- رمزهای عبور با PBKDF2-SHA256 (۱۰۰٬۰۰۰ تکرار) و Salt اختصاصی برای هر کاربر هش می‌شوند؛ هرگز رمز عبور را به‌صورت متن ساده ذخیره یا به اشتراک نگذارید.
+- کوکی‌های نشست `HttpOnly` و روی HTTPS از نوع `Secure` هستند — همیشه پشت HTTPS دیپلوی کنید (Cloudflare Workers به‌طور پیش‌فرض این کار را انجام می‌دهد).
+- توکن API کلادفلر و توکن ربات تلگرام در دیتابیس D1 شما ذخیره می‌شوند — دسترسی به داشبورد/دیتابیس را فقط به افراد مورد اعتماد محدود کنید.
+- نسخه‌های پشتیبان (از طریق قابلیت داخلی Backup) را در جای امنی نگه دارید، چون شامل اطلاعات کاربران و اعتبارنامه‌های VPN هستند.
 
-## Troubleshooting
+## رفع اشکال
 
-| Symptom | Likely cause |
+| علامت | علت احتمالی |
 |---|---|
-| Setup wizard won't proceed | `DB` binding missing or misspelled — must be exactly `DB` |
-| VLESS/Trojan tunnel fails to connect | Compatibility Date is older than `2024-09-01`, or `cloudflare:sockets` isn't available on your plan |
-| DNS/zone/cache features are disabled or error out | No Cloudflare API token set, or the token lacks the required Zone/DNS/Cache permissions |
-| No Telegram alerts | Bot token/chat ID not set, or the bot hasn't been started (`/start`) with that chat |
+| ویزارد راه‌اندازی جلو نمی‌رود | Binding با نام `DB` وصل نیست یا اشتباه تایپ شده — باید دقیقاً `DB` باشد |
+| تونل VLESS/Trojan متصل نمی‌شود | تاریخ Compatibility Date قدیمی‌تر از `2024-09-01` است، یا `cloudflare:sockets` روی پلن شما در دسترس نیست |
+| امکانات DNS/زون/پاکسازی کش غیرفعال است یا خطا می‌دهد | API Token کلادفلر تنظیم نشده، یا توکن دسترسی‌های لازم (Zone/DNS/Cache) را ندارد |
+| هشدار تلگرام دریافت نمی‌شود | توکن ربات/شناسه چت تنظیم نشده، یا ربات هنوز با آن چت استارت (`/start`) نشده است |
 
-## License
+## مجوز
 
-No license file was included with the source. Add a `LICENSE` file (e.g. MIT, Apache-2.0, or a proprietary notice) before publishing this repository publicly, to make the terms of use clear to others.
+هیچ فایل مجوزی به همراه سورس‌کد ارائه نشده است. پیش از انتشار عمومی این ریپازیتوری، یک فایل `LICENSE` (مثلاً MIT، Apache-2.0 یا یک اعلامیه‌ی اختصاصی) اضافه کنید تا شرایط استفاده برای دیگران روشن باشد.
