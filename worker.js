@@ -2018,7 +2018,7 @@ async function handleApi(request, env, url) {
     var allIps = [];
     try { allIps = parseIpLines(await settingGet(env.DB, 'proxy_ips')); } catch (eA) {}
     try { useIps = await enabledIps(env.DB); } catch (eI) {}
-    return json({ ok: true, proxy: o, loc: loc, ports: portsOn, ports_all: CF_ALL, ports_http: CF_HTTP, ports_https: CF_HTTPS, hosts: hosts, ips: allIps.length ? allIps : useIps, ips_on: useIps, peers: list });
+    return json({ ok: true, proxy: o, loc: loc, ports: portsOn, ports_all: CF_ALL, ports_http: CF_HTTP, ports_https: CF_HTTPS, hosts: hosts, ips: useIps, ips_on: useIps, ips_all: allIps, peers: list });
   }
 
   if (path === '/api/vpn' && method === 'POST') {
@@ -3699,8 +3699,9 @@ function syncIpPick(){
     ip = ips[i];
     ping = S.ipPing ? S.ipPing[ip] : null;
     html += '<label class="pill"><input type="checkbox" name="proxy_ip_on" value="' + esc(ip) + '"' + (on[ip] ? ' checked' : '') + '> ' + esc(ip);
-    if (ping === -1) html += ' · N/A';
-    else if (typeof ping === 'number') html += ' · ' + ping + 'ms';
+    if (ping === 'wait' || ping === '…') html += ' · …';
+    else if (ping === -1) html += ' · N/A';
+    else if (typeof ping === 'number' && ping >= 0) html += ' · ' + ping + 'ms';
     html += '</label>';
   }
   box.innerHTML = html + '</div>';
@@ -3836,7 +3837,11 @@ function vpnModal(pr){
     '<div class="field"><label>', esc(t('vpn_maxip')), '</label><input class="input" name="max_ip" type="number" min="0" value="', esc(pr ? String(pr.max_ip||0) : '0'), '"></div>',
     '<div class="field"><label>', esc(t('speed')), '</label><input class="input" name="speed_mbps" type="number" min="0" step="0.1" value="', esc(pr ? String(((Number(pr.speed_kbps)||0)/1024)) : '0'), '"></div>',
     (function(){
-      var pool = S.vpnIps || [];
+      var pool = (S.vpnIps || []).slice();
+      if (pr && pr.ips){
+        var extraIp = String(pr.ips).split(/[\s,]+/).filter(Boolean)[0];
+        if (extraIp && pool.indexOf(extraIp) === -1) pool.unshift(extraIp);
+      }
       if (!pool.length) return '<p class="hint">' + esc(t('vpn_ip_none')) + '</p>';
       var sel = String((pr && pr.ips) || '').split(/[\s,]+/).filter(Boolean)[0] || '';
       var html = '<div class="field"><label>' + esc(t('vpn_ip_pick')) + '</label>';
@@ -4473,33 +4478,36 @@ document.getElementById('app').addEventListener('click', function(e){
     var ipsP = taIps();
     if (!ipsP.length){ toast(t('ips_pick_empty'), true); return; }
     toast(t('ips_wait'));
-    S.ipPing = {};
+    S.ipPing = S.ipPing || {};
+    var wi;
+    for (wi = 0; wi < ipsP.length; wi++) S.ipPing[ipsP[wi]] = 'wait';
     syncIpPick();
-    function afterBrowser(){
-      api('/api/ips/ping','POST',{ ips: ipsP }).then(function(r){
-        var arr = (r && r.pings) || [];
-        var pi;
-        for (pi = 0; pi < arr.length; pi++){
-          if (arr[pi].ok && (S.ipPing[arr[pi].ip] == null || S.ipPing[arr[pi].ip] < 0)) S.ipPing[arr[pi].ip] = arr[pi].ms;
-          else if (S.ipPing[arr[pi].ip] == null) S.ipPing[arr[pi].ip] = arr[pi].ok ? arr[pi].ms : -1;
-        }
+    function pingChunk(i){
+      if (i >= ipsP.length){
         syncIpPick();
         toast(t('ips_ping') + ' · ' + ipsP.length);
-      }).catch(function(){ syncIpPick(); });
-    }
-    function run(i){
-      if (i >= ipsP.length){ afterBrowser(); return; }
+        return;
+      }
       var n = Math.min(5, ipsP.length - i);
-      var jobs = [], k;
-      for (k = 0; k < n; k++) jobs.push(pingIpBrowser(ipsP[i + k]));
-      Promise.all(jobs).then(function(rs){
-        var j;
-        for (j = 0; j < rs.length; j++) S.ipPing[rs[j].ip] = rs[j].ok ? rs[j].ms : -1;
+      var chunk = ipsP.slice(i, i + n);
+      api('/api/ips/ping','POST',{ ips: chunk }).then(function(r){
+        var arr = (r && r.pings) || [];
+        var map = {}, j;
+        for (j = 0; j < arr.length; j++) map[arr[j].ip] = arr[j];
+        for (j = 0; j < chunk.length; j++){
+          var row = map[chunk[j]];
+          S.ipPing[chunk[j]] = (row && row.ok) ? row.ms : -1;
+        }
         syncIpPick();
-        run(i + n);
+        pingChunk(i + n);
+      }).catch(function(){
+        var j;
+        for (j = 0; j < chunk.length; j++) if (S.ipPing[chunk[j]] === 'wait') S.ipPing[chunk[j]] = -1;
+        syncIpPick();
+        pingChunk(i + n);
       });
     }
-    run(0);
+    pingChunk(0);
     return;
   }
   if (act === 'theme-tog'){
