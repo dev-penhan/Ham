@@ -72,7 +72,7 @@
    - ⚠️ If `DB` is not bound, the setup wizard will refuse to proceed.
 
 4. **Set the Compatibility Date**
-   - **Settings → Compatibility Date** → set to `2024-09-01` or a later date.
+   - **Settings → Compatibility Date** → set to `2026-09-01` or a later date.
    - This is required so the `cloudflare:sockets` API (used for the VLESS/Trojan tunnel) is available.
 
 5. **Deploy**
