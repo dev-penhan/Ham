@@ -2,9 +2,6 @@
 
 **Ham** is a single-file, self-hosted control panel that runs entirely as a **Cloudflare Worker**. It ships with a built-in admin dashboard, user/role management, a **VLESS + Trojan (WebSocket + TLS)** proxy tunnel served directly from the Worker, subscription-link generation, Cloudflare DNS/zone management, cache purging, Telegram notifications, and D1-backed persistence — all in one `.js` file with no build step and no external server required.
 
-> ⚠️ **Legal notice / Disclaimer**
-> This project can be used to operate a VPN/proxy service. Running proxy or VPN infrastructure may be regulated or restricted in some countries. You are solely responsible for complying with your local laws, Cloudflare's Terms of Service / Acceptable Use Policy, and the terms of any service you connect to this panel. Use it only for lawful purposes and only for traffic/users you are authorized to serve.
-
 ---
 
 ## Table of Contents
