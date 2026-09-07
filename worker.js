@@ -392,8 +392,10 @@ async function ensureVpn(db) {
     'ALTER TABLE vpn_subs ADD COLUMN sub_pass TEXT DEFAULT \'\'',
     'ALTER TABLE vpn_subs ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE vpn_subs ADD COLUMN burned INTEGER NOT NULL DEFAULT 0',
-    'ALTER TABLE vpn_peers ADD COLUMN remark TEXT DEFAULT \'\''
+    'ALTER TABLE vpn_peers ADD COLUMN remark TEXT DEFAULT \'\'',
+    'ALTER TABLE vpn_peers ADD COLUMN last_seen TEXT DEFAULT \'\''
   ];
+  try { await migrateDefaultPorts(db); } catch (eMig) {}
   try {
     await db.exec('CREATE TABLE IF NOT EXISTS vpn_usage (day TEXT NOT NULL, kind TEXT NOT NULL, owner_id INTEGER NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, kind, owner_id));');
   } catch (e0) {}
@@ -470,13 +472,15 @@ function fmtBytes(n) {
   return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
+var CF_CORE = [80, 8080, 2052, 443];
+var CF_ALL = CF_CORE.slice();
 var CF_HTTP = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-var CF_HTTPS = [443, 2053, 2083];
-var CF_ALL = [80, 8080, 8880, 2052, 2082, 2086, 2095, 443, 2053, 2083];
+var CF_HTTPS = [443, 2053, 2083, 2087, 2096, 8443];
 
 function isTlsPort(port) {
   port = Number(port);
-  return port === 443 || port === 2053 || port === 2083;
+  if (CF_HTTP.indexOf(port) !== -1) return false;
+  return true;
 }
 
 function parseCsv(s) {
@@ -498,24 +502,68 @@ function cleanProtos(s) {
   return out.length ? out : ['vless'];
 }
 
-function cleanPorts(s, single) {
+function parsePortNums(s) {
   var raw = parseCsv(String(s || ''));
   var out = [];
   var i, n;
   for (i = 0; i < raw.length; i++) {
     n = parseInt(raw[i], 10);
-    if (CF_ALL.indexOf(n) === -1) continue;
+    if (!(n >= 1 && n <= 65535)) continue;
     if (out.indexOf(n) === -1) out.push(n);
   }
-  if (!out.length) out = [443];
+  return out;
+}
+
+function cleanPorts(s, single) {
+  var out = parsePortNums(s);
+  if (!out.length) out = CF_ALL.slice();
   if (single) return [out[0]];
   return out;
 }
 
 async function enabledPorts(db) {
   var raw = await settingGet(db, 'cf_ports');
-  if (!raw) return CF_ALL.slice();
-  return cleanPorts(raw, false);
+  var extra = await settingGet(db, 'extra_ports');
+  var a = raw ? parsePortNums(raw) : CF_ALL.slice();
+  var e = extra ? parsePortNums(extra) : [];
+  var i, out = [];
+  for (i = 0; i < a.length; i++) if (out.indexOf(a[i]) === -1) out.push(a[i]);
+  for (i = 0; i < e.length; i++) if (out.indexOf(e[i]) === -1) out.push(e[i]);
+  if (!out.length) out = CF_ALL.slice();
+  return out;
+}
+
+async function disableBadPortPeers(db) {
+  var ports = await enabledPorts(db);
+  var peers = [];
+  try { peers = await dbAll(db, 'SELECT id, port, enabled FROM vpn_peers'); } catch (e0) { return; }
+  var i, n;
+  for (i = 0; i < peers.length; i++) {
+    if (!peers[i].enabled) continue;
+    n = Number(peers[i].port) || 0;
+    if (ports.indexOf(n) === -1) {
+      try { await dbRun(db, 'UPDATE vpn_peers SET enabled = 0 WHERE id = ?', peers[i].id); } catch (e1) {}
+    }
+  }
+}
+
+async function migrateDefaultPorts(db) {
+  var flag = '';
+  try { flag = await settingGet(db, 'ports_v2'); } catch (e0) {}
+  if (flag === '1') return;
+  var raw = '';
+  try { raw = await settingGet(db, 'cf_ports'); } catch (e1) {}
+  if (raw) {
+    var old = parsePortNums(raw);
+    var core = [];
+    var i;
+    for (i = 0; i < old.length; i++) if (CF_CORE.indexOf(old[i]) !== -1) core.push(old[i]);
+    if (!core.length) core = CF_ALL.slice();
+    await settingSet(db, 'cf_ports', core.join(','));
+    await settingSet(db, 'extra_ports', '');
+  }
+  await settingSet(db, 'ports_v2', '1');
+  try { await disableBadPortPeers(db); } catch (e2) {}
 }
 
 function extraQuery(pr) {
@@ -602,9 +650,15 @@ async function tgSend(env, ctx, text) {
 }
 
 function faDigitsToEn(s) {
-  return String(s || '').replace(/[۰-۹]/g, function (d) {
-    return String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d));
-  }).replace(/\s+/g, '');
+  s = String(s || '');
+  var fa = '۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩';
+  var en = '01234567890123456789';
+  var i, p, out = '';
+  for (i = 0; i < s.length; i++) {
+    p = fa.indexOf(s.charAt(i));
+    out += p >= 0 ? en.charAt(p) : s.charAt(i);
+  }
+  return out.replace(/\s+/g, '');
 }
 
 async function maybeAlert(env, ctx, row, kind) {
@@ -718,13 +772,37 @@ function trojanHash(pass) {
   return sha224Hex(new TextEncoder().encode(String(pass || '')));
 }
 
+async function canonicalHost(db, fallback) {
+  var h = '';
+  try { h = String((await settingGet(db, 'panel_host')) || '').trim(); } catch (e0) { h = ''; }
+  h = h.replace(/^https?:\/\//, '').split('/')[0].trim();
+  fallback = String(fallback || '').trim();
+  if (!h) h = fallback;
+  return h;
+}
+
+async function rememberPanelHost(db, request) {
+  try {
+    var cur = String((await settingGet(db, 'panel_host')) || '').trim();
+    if (cur) return;
+    var h = '';
+    try { h = new URL(request.url).hostname; } catch (e1) { h = ''; }
+    if (!h) return;
+    var backs = [];
+    try { backs = parseHostLines(await settingGet(db, 'backup_hosts')); } catch (eB) {}
+    if (backs.indexOf(h) !== -1) return;
+    await settingSet(db, 'panel_host', h);
+  } catch (e2) {}
+}
+
 async function proxySettings(db, host) {
   var path = normPath((await settingGet(db, 'vpn_path')) || '/vpnws');
   var ips = [];
   try { ips = await enabledIps(db); } catch (e) { ips = []; }
   var backups = [];
-  try { backups = parseIpLines(await settingGet(db, 'backup_hosts')); } catch (eB) { backups = []; }
-  return { host: host, path: path, sni: host, wsHost: host, fp: 'chrome', ips: ips, backups: backups };
+  try { backups = parseHostLines(await settingGet(db, 'backup_hosts')); } catch (eB) { backups = []; }
+  var main = await canonicalHost(db, host);
+  return { host: main, path: path, sni: main, wsHost: main, fp: 'chrome', ips: ips, backups: backups };
 }
 
 function parseIpLines(s) {
@@ -736,6 +814,21 @@ function parseIpLines(s) {
     if (!x || x.charAt(0) === '#') continue;
     if (x.length > 64) continue;
     if (!/^[0-9A-Za-z.:_-]+$/.test(x)) continue;
+    if (out.indexOf(x) === -1) out.push(x);
+  }
+  return out;
+}
+
+function parseHostLines(s) {
+  var parts = String(s || '').split(/[\n,\s]+/);
+  var out = [];
+  var i, x;
+  for (i = 0; i < parts.length; i++) {
+    x = String(parts[i] || '').trim().replace(/^https?:\/\//, '').split('/')[0];
+    if (!x || x.charAt(0) === '#') continue;
+    if (x.length > 253) continue;
+    if (!/^[A-Za-z0-9.:_-]+$/.test(x)) continue;
+    if (isIpAddr(x)) continue;
     if (out.indexOf(x) === -1) out.push(x);
   }
   return out;
@@ -1081,8 +1174,11 @@ async function proxyTcp(ws, info, meter, pump) {
     if (addrs.indexOf(h) === -1) addrs.push(h);
   }
   addAddr(host);
+  var addrsTry = [host, host];
   var ti;
-  for (ti = 0; ti < proxies.length; ti++) addAddr(proxies[ti]);
+  for (ti = 0; ti < proxies.length; ti++) {
+    if (String(proxies[ti] || '') !== host) addrsTry.push(proxies[ti]);
+  }
   var buf = [];
   if (info.payload && info.payload.length) buf.push(info.payload);
   var liveWriter = null;
@@ -1100,6 +1196,7 @@ async function proxyTcp(ws, info, meter, pump) {
     }
   })();
   var ai, sock, writer, got, downDone, down, t0, flushed, bi;
+  addrs = addrsTry;
   for (ai = 0; ai < addrs.length; ai++) {
     if (closed) break;
     sock = null;
@@ -1128,7 +1225,7 @@ async function proxyTcp(ws, info, meter, pump) {
       abort: function () { downDone = true; }
     })).catch(function () { downDone = true; });
     t0 = Date.now();
-    while (!got && !downDone && !closed && Date.now() - t0 < (ai === 0 ? 4500 : 2800)) {
+    while (!got && !downDone && !closed && Date.now() - t0 < (addrs[ai] === host ? 9000 : 4000)) {
       await new Promise(function (r) { setTimeout(r, 40); });
     }
     if (got) {
@@ -1273,6 +1370,7 @@ async function runTunnel(ws, env, ctx, ip, pump, early) {
       try { ws.close(); } catch (e2) {}
       return;
     }
+    try { await dbRun(env.DB, 'UPDATE vpn_peers SET last_seen = ? WHERE id = ?', nowIso(), peer.id); } catch (eLs) {}
     meter.id = peer.id;
     meter.kind = peer._kind === 'sub' ? 'sub' : 'peer';
     meter.speed = Number(peer.speed_kbps) || 0;
@@ -1366,6 +1464,9 @@ async function handleApi(request, env, url) {
     if (out.setup) {
       var pn = await settingGet(env.DB, 'panel_name');
       if (pn) out.panel = pn;
+    }
+    if (out.authed) {
+      try { await rememberPanelHost(env.DB, request); } catch (ePh) {}
     }
     return json(out);
   }
@@ -1677,6 +1778,8 @@ async function handleApi(request, env, url) {
 
   if (path === '/api/settings' && method === 'GET') {
     var portsOn = await enabledPorts(env.DB);
+    var cfSaved = parsePortNums(await settingGet(env.DB, 'cf_ports'));
+    if (!cfSaved.length) cfSaved = CF_ALL.slice();
     return json({
       ok: true,
       ports_all: CF_ALL,
@@ -1688,7 +1791,7 @@ async function handleApi(request, env, url) {
         vpn_path: (await settingGet(env.DB, 'vpn_path')) || '/vpnws',
         camouflage_url: (await settingGet(env.DB, 'camouflage_url')) || 'https://ubuntu.com/',
         panel_path: (await settingGet(env.DB, 'panel_path')) || '/dash',
-        cf_ports: portsOn.join(','),
+        cf_ports: cfSaved.join(','),
         tg_token: await settingGet(env.DB, 'tg_token'),
         tg_chat: await settingGet(env.DB, 'tg_chat'),
         theme: (await settingGet(env.DB, 'theme')) === 'dark' ? 'dark' : 'light',
@@ -1696,6 +1799,8 @@ async function handleApi(request, env, url) {
         proxy_ips: await settingGet(env.DB, 'proxy_ips'),
         proxy_ips_on: await settingGet(env.DB, 'proxy_ips_on'),
         backup_hosts: await settingGet(env.DB, 'backup_hosts'),
+        extra_ports: await settingGet(env.DB, 'extra_ports'),
+        panel_host: await settingGet(env.DB, 'panel_host'),
         tg_2fa: (await settingGet(env.DB, 'tg_2fa')) === '1' ? '1' : '0'
       }
     });
@@ -1714,10 +1819,15 @@ async function handleApi(request, env, url) {
       var npp = normPath(sb.panel_path);
       if (npp !== '/sub' && npp !== '/api') await settingSet(env.DB, 'panel_path', npp);
     }
-    if (typeof sb.cf_ports === 'string') await settingSet(env.DB, 'cf_ports', cleanPorts(sb.cf_ports, false).join(','));
+    if (typeof sb.cf_ports === 'string') await settingSet(env.DB, 'cf_ports', parsePortNums(sb.cf_ports).join(','));
+    if (typeof sb.extra_ports === 'string') await settingSet(env.DB, 'extra_ports', parsePortNums(sb.extra_ports).join(','));
+    if (typeof sb.panel_host === 'string') {
+      var ph = sb.panel_host.trim().replace(/^https?:\/\//, '').split('/')[0];
+      await settingSet(env.DB, 'panel_host', ph);
+    }
     if (sb.theme === 'dark' || sb.theme === 'light') await settingSet(env.DB, 'theme', sb.theme);
     if (typeof sb.extra_hosts === 'string') await settingSet(env.DB, 'extra_hosts', sb.extra_hosts);
-    if (typeof sb.backup_hosts === 'string') await settingSet(env.DB, 'backup_hosts', sb.backup_hosts);
+    if (typeof sb.backup_hosts === 'string') await settingSet(env.DB, 'backup_hosts', parseHostLines(sb.backup_hosts).join('\n'));
     if (typeof sb.proxy_ips === 'string') {
       var pip = parseIpLines(sb.proxy_ips);
       await settingSet(env.DB, 'proxy_ips', pip.join('\n'));
@@ -1750,6 +1860,7 @@ async function handleApi(request, env, url) {
         });
       } catch (e) {}
     }
+    try { await disableBadPortPeers(env.DB); } catch (eDis) {}
     await audit(env.DB, me.id, 'settings_update', '', ip);
     return json({ ok: true });
   }
@@ -2009,16 +2120,36 @@ async function handleApi(request, env, url) {
         location: pr.location || loc,
         enabled: pr.enabled,
         alive: peerAlive(pr) ? 1 : 0,
+        last_seen: pr.last_seen || '',
+        last_h: pr.last_seen ? fmtTehran(pr.last_seen) : '',
+        online: !!(pr.last_seen && (Date.now() - Date.parse(pr.last_seen) < 180000) && peerAlive(pr)),
         created_at: pr.created_at,
         links: peerLinks(pr, o)
       });
     }
-    var hosts = String(await settingGet(env.DB, 'extra_hosts') || '').split(/\n/).map(function (x) { return x.trim(); }).filter(Boolean);
+    var hosts = parseHostLines(await settingGet(env.DB, 'backup_hosts'));
     var useIps = [];
     var allIps = [];
     try { allIps = parseIpLines(await settingGet(env.DB, 'proxy_ips')); } catch (eA) {}
     try { useIps = await enabledIps(env.DB); } catch (eI) {}
     return json({ ok: true, proxy: o, loc: loc, ports: portsOn, ports_all: CF_ALL, ports_http: CF_HTTP, ports_https: CF_HTTPS, hosts: hosts, ips: useIps, ips_on: useIps, ips_all: allIps, peers: list });
+  }
+
+  if (path === '/api/vpn/alive' && method === 'GET') {
+    await ensureVpn(env.DB);
+    var ap = await dbAll(env.DB, 'SELECT id, last_seen, enabled, expire_at, quota_bytes, used_bytes FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0');
+    var al = [];
+    var aj;
+    for (aj = 0; aj < ap.length; aj++) {
+      var ar = ap[aj];
+      al.push({
+        id: ar.id,
+        last_seen: ar.last_seen || '',
+        last_h: ar.last_seen ? fmtTehran(ar.last_seen) : '',
+        online: !!(ar.last_seen && (Date.now() - Date.parse(ar.last_seen) < 180000) && peerAlive(ar))
+      });
+    }
+    return json({ ok: true, peers: al });
   }
 
   if (path === '/api/vpn' && method === 'POST') {
@@ -2419,9 +2550,8 @@ async function tgSendQr(token, chatId, link, caption) {
     chat_id: chatId,
     photo: qr,
     caption: String(caption || '').slice(0, 1024),
-    reply_markup: tgShareBtn(link)
+    reply_markup: tgMenu()
   });
-  await tgApi(token, 'sendMessage', { chat_id: chatId, text: link, reply_markup: tgMenu() });
 }
 
 function tgMenu() {
@@ -2433,6 +2563,45 @@ function tgMenu() {
     ],
     resize_keyboard: true
   };
+}
+
+
+function parseQuotaToken(text) {
+  var s = faDigitsToEn(String(text || '').trim());
+  if (/نامحدود|∞/.test(s) && !/\d/.test(s)) return 0;
+  var n = parseFloat(s.replace(/[^0-9.]/g, ''));
+  if (isNaN(n) || n < 0) n = 0;
+  if (n > 50) n = 50;
+  return n;
+}
+
+function parseDaysToken(text) {
+  var s = faDigitsToEn(String(text || '').trim());
+  if (/ماه/.test(s)) {
+    if (/4/.test(s)) return 120;
+    if (/3/.test(s)) return 90;
+    if (/2/.test(s)) return 60;
+    return 30;
+  }
+  if (/نامحدود|∞/.test(s) && !/\d/.test(s)) return 0;
+  var n = parseInt(s.replace(/[^0-9]/g, ''), 10);
+  if (isNaN(n) || n < 0) n = 0;
+  if (n > 120) n = 120;
+  return n;
+}
+
+function tgGridKb(from, to, cols, extraRow) {
+  var kb = [];
+  var row = [];
+  var i, lab;
+  for (i = from; i <= to; i++) {
+    lab = i === 0 ? '0 ∞' : String(i);
+    row.push({ text: lab });
+    if (row.length === cols) { kb.push(row); row = []; }
+  }
+  if (row.length) kb.push(row);
+  if (extraRow && extraRow.length) kb.push(extraRow);
+  return { keyboard: kb, resize_keyboard: true, one_time_keyboard: true };
 }
 
 async function tgFlowGet(db) {
@@ -2544,7 +2713,8 @@ async function handleTelegram(request, env, url) {
     }
     var commands = {
       'ساخت فیلترشکن': 1, 'مدیریت فیلترشکن': 1, 'وضعیت پنل': 1, 'پشتیبان': 1,
-      'آی‌پی پروکسی': 1, '/start': 1, '/help': 1, 'شروع': 1, 'منو': 1, '/vpn': 1
+      'آی‌پی پروکسی': 1,
+      '/start': 1, '/help': 1, 'شروع': 1, 'منو': 1, '/vpn': 1
     };
     if (text && commands[text]) await tgFlowSet(env.DB, {});
     var flow = await tgFlowGet(env.DB);
@@ -2558,26 +2728,24 @@ async function handleTelegram(request, env, url) {
           if (nm === 'تصادفی' || nm === 'random' || nm === '-') nm = randPeerName();
           if (!nm) { await send('اسم خالی است.'); return json({ ok: true }); }
           flow.name = nm;
-          flow.step = 'days';
-          flow.at = Date.now();
-          await tgFlowSet(env.DB, flow);
-          await send('مدت زمان را به روز بفرستید (مثلاً 30).\n۰ = نامحدود');
-          return json({ ok: true });
-        }
-        if (st === 'days') {
-          var ds = parseInt(String(text).replace(/[^\d]/g, ''), 10);
-          if (isNaN(ds)) ds = 0;
-          flow.days = ds;
           flow.step = 'quota';
           flow.at = Date.now();
           await tgFlowSet(env.DB, flow);
-          await send('حجم را به گیگابایت بفرستید (مثلاً 50).\n۰ = نامحدود');
+          await send('از منوی زیر حجم را انتخاب کنید (گیگابایت).\n۰ = نامحدود', tgGridKb(0, 50, 5));
           return json({ ok: true });
         }
         if (st === 'quota') {
-          var qn = parseFloat(String(text).replace(',', '.'));
-          if (isNaN(qn) || qn < 0) qn = 0;
+          var qn = parseQuotaToken(text);
           flow.quota = qn;
+          flow.step = 'days';
+          flow.at = Date.now();
+          await tgFlowSet(env.DB, flow);
+          await send('از منوی زیر مدت را انتخاب کنید (روز).\n۰ = نامحدود', tgGridKb(0, 120, 8, [{ text: '۱ ماهه' }, { text: '۲ ماهه' }, { text: '۳ ماهه' }, { text: '۴ ماهه' }]));
+          return json({ ok: true });
+        }
+        if (st === 'days') {
+          var ds = parseDaysToken(text);
+          flow.days = ds;
           flow.step = 'ip';
           flow.at = Date.now();
           await tgFlowSet(env.DB, flow);
@@ -3033,6 +3201,7 @@ const HTML = String.raw`<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ham</title>
+<link rel="icon" type="image/png" href="data:image/png;base64,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">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -3067,9 +3236,15 @@ body{background:var(--bg)}
 .bgfx .b1{background:var(--blob1);top:-12%;inset-inline-start:-8%;animation:drift1 22s ease-in-out infinite}
 .bgfx .b2{background:var(--blob2);bottom:-16%;inset-inline-end:-10%;animation:drift2 26s ease-in-out infinite}
 .bgfx .b3{background:var(--blob3);top:38%;inset-inline-start:42%;opacity:.28;animation:drift3 20s ease-in-out infinite}
+.bgfx .b4{background:var(--blob1);width:min(38vw,280px);height:min(38vw,280px);top:8%;inset-inline-end:8%;opacity:.32;animation:drift4 16s ease-in-out infinite}
+.bgfx .b5{background:var(--blob2);width:min(44vw,340px);height:min(44vw,340px);bottom:12%;inset-inline-start:18%;opacity:.26;animation:drift5 28s ease-in-out infinite}
+.bgfx .b6{background:var(--blob3);width:min(24vw,180px);height:min(24vw,180px);top:58%;inset-inline-end:28%;opacity:.22;animation:pulse 9s ease-in-out infinite}
 @keyframes drift1{50%{transform:translate3d(12%,10%,0) scale(1.12)}}
 @keyframes drift2{50%{transform:translate3d(-14%,-8%,0) scale(1.08)}}
 @keyframes drift3{50%{transform:translate3d(-10%,12%,0) scale(1.18)}}
+@keyframes drift4{50%{transform:translate3d(-18%,14%,0) scale(1.22) rotate(8deg)}}
+@keyframes drift5{50%{transform:translate3d(16%,-12%,0) scale(1.15)}}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:.2}50%{transform:scale(1.35);opacity:.38}}
 @media (prefers-reduced-motion:reduce){
   .bgfx span{animation:none}
 }
@@ -3144,6 +3319,14 @@ main{padding:24px 20px 40px;max-width:1100px;width:100%;margin:0 auto}
 .pill.ok{color:var(--ok);border-color:rgba(26,168,122,.35);background:rgba(26,168,122,.1)}
 .pill.warn{color:var(--gold2);border-color:var(--line2)}
 .pill.bad{color:var(--red);border-color:rgba(224,86,86,.3);background:rgba(224,86,86,.1)}
+.alive-wrap{position:relative;display:inline-block;margin-inline-start:8px;vertical-align:middle}
+.alive-box{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 8px;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer;user-select:none}
+.alive-box.on{background:#16a34a;color:#fff}
+.alive-box.off{background:#6b7280;color:#fff}
+.alive-tip{display:none;position:absolute;top:126%;inset-inline-start:0;z-index:8;background:var(--card);border:1px solid var(--line);padding:7px 10px;border-radius:10px;font-size:11px;white-space:nowrap;box-shadow:0 10px 28px rgba(0,0,0,.16)}
+.alive-wrap:hover .alive-tip,.alive-wrap.open .alive-tip{display:block}
+.host-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.host-chips .pill{cursor:default}
 .help{background:var(--card2);border:1px dashed var(--line2);border-radius:12px;padding:14px;font-size:13px;color:var(--muted);line-height:1.7}
 ol.guide{list-style:none;margin:10px 0 0;padding:0}
 ol.guide li{display:flex;gap:10px;align-items:flex-start;margin:0 0 11px;line-height:1.65;color:var(--text);font-size:13px}
@@ -3227,7 +3410,7 @@ html[data-theme="dark"] .toast{color:#0b0d12}
 </style>
 </head>
 <body>
-<div class="bgfx" aria-hidden="true"><span class="b1"></span><span class="b2"></span><span class="b3"></span></div>
+<div class="bgfx" aria-hidden="true"><span class="b1"></span><span class="b2"></span><span class="b3"></span><span class="b4"></span><span class="b5"></span><span class="b6"></span></div>
 <div id="app"></div>
 <div id="toast"></div>
 <script>
@@ -3303,7 +3486,7 @@ set_sec:'امنیت و استتار', set_panel_path:'مسیر پنل', set_pane
 set_camo:'آدرس استتار', set_camo_h:'اگر کسی دامنه را بدون مسیر پنل باز کند به این آدرس می‌رود.',
 set_kill:'خروج از همه دستگاه‌ها', set_reset_tr:'صفر کردن ترافیک همه کانفیگ‌ها',
 ips:'آی‌پی اتصال', ips_h:'هر خط یک IP. در ویرایش فیلترشکن/ساب تیک بزن تا همان یک کانفیگ از روی آن IP وصل شود — برای هر IP کانفیگ جدا ساخته نمی‌شود.', ips_none:'اول در تنظیمات IP وارد کن.', ips_pick:'آی‌پی‌ها', tg_bot:'ربات منو دارد: ساخت، دریافت لینک، ارسال برای کسی. توکن را ذخیره کنید تا وب‌هوک ست شود.',
-ports:'پورت‌های کلادفلر', ports_h:'پورت‌های رایج پروکسی کلادفلر. هر کدام را اینجا فعال کنید تا در ساخت کانفیگ و ساب دیده شود.',
+ports:'پورت‌های کلادفلر', ports_h:'پیش‌فرض: ۸۰، ۸۰۸۰، ۴۴۳ و ۲۰۵۲. بقیه را در پورت اضافه بنویسید.',
 port:'پورت',
 sub_brand:'برند ساب',
 tg:'تلگرام', tg_token:'توکن ربات', tg_chat:'Chat ID', tg_h:'وقتی حجم یا زمان تمام شود پیام می‌فرستد. ربات با /vpn و /sub کانفیگ می‌سازد.', tg_test:'ارسال تست',
@@ -3330,7 +3513,12 @@ sub_pass:'رمز ساب (اختیاری)', one_shot:'لینک یک‌بارمص�
 clash:'کلش', singbox:'sing-box', extra_hosts:'دامنه‌های اضافه (هر خط یکی)', extra_hosts_h:'دامنه‌هایی که به همین ورکر وصل شده‌اند. در ساخت کانفیگ می‌توانید یکی را انتخاب کنید.',
 tg_2fa:'ورود دومرحله‌ای با تلگرام', tg_2fa_h:'بعد از رمز، کد ۶ رقمی به بات تلگرام می‌رود.', otp:'کد تلگرام', otp_h:'کد ۶ رقمی را از بات بخوانید.',
 proxy_ips:'پروکسی خروجی', proxy_ips_h:'این آی‌پی‌ها داخل لینک کانفیگ نمی‌آیند. بعد از وصل شدن، ترافیک خروجی ورکر از این پروکسی‌ها رد می‌شود (برای سایت‌هایی مثل ChatGPT که مستقیم از ورکر باز نمی‌شوند). اگر خالی باشد خروجی مستقیم است.',
-backup_hosts:'ورکر پشتیبان (هر خط یک دامنه)', backup_hosts_h:'فقط دامنهٔ اضافه برای لینک VLESS (همان ورکر). ورکر جدا با دیتابیس جدا همگام نیست.',
+backup_hosts:'ورکر پشتیبان (هر خط یک دامنه)', backup_hosts_h:'بعد از ذخیره همین‌جا برای ساخت کانفیگ دیده می‌شوند. بازدید از دامنهٔ پشتیبان آدرس داخل لینک را عوض نمی‌کند؛ همیشه دامنهٔ اصلی پنل استفاده می‌شود.',
+panel_host:'دامنهٔ اصلی کانفیگ', panel_host_h:'همین دامنه داخل لینک VLESS می‌آید. دامنهٔ پشتیبان را اینجا نگذارید.',
+extra_ports:'پورت اضافه', extra_ports_h:'پورت‌هایی غیر از پیش‌فرض. کانفیگ‌های پورت حذف‌شده خاموش می‌شوند، پاک نمی‌شوند.',
+backup_none:'هنوز دامنه‌ای ذخیره نشده.',
+online:'آنلاین', offline:'آفلاین', last_conn:'آخرین اتصال',
+
 ips_best:'تیک ۵ تای بهتر',
 vpn_ip_test:'تست پینگ آی‌پی‌ها', vpn_ip_direct:'بدون پروکسی (خروجی مستقیم)',
 remark:'نام نمایشی (اختیاری)', remark_h:'خالی = کشور + اسم تصادفی، مثلاً NL 7sb5v',
@@ -3413,7 +3601,7 @@ set_sec:'Security and camouflage', set_panel_path:'Panel path', set_panel_path_h
 set_camo:'Camouflage URL', set_camo_h:'Visiting the domain without the panel path redirects here.',
 set_kill:'Sign out all sessions', set_reset_tr:'Reset traffic on all configs',
 ips:'Connect IPs', ips_h:'One IP per line. Tick in VPN/sub edit so that single config connects via the IP — not one config per IP.', ips_none:'Add IPs in Settings first.', ips_pick:'IPs', tg_bot:'The bot has a menu: create, get links, share. Save the token to set the webhook.',
-ports:'Cloudflare ports', ports_h:'Common Cloudflare proxy ports. Enable the ones you want to offer when creating a config or subscription.',
+ports:'Cloudflare ports', ports_h:'Defaults: 80, 8080, 443, 2052. Add others in Extra ports.',
 port:'Port',
 sub_brand:'Sub brand',
 tg:'Telegram', tg_token:'Bot token', tg_chat:'Chat ID', tg_h:'Sends a message when quota or time runs out. The bot also creates configs with /vpn and /sub.', tg_test:'Send test',
@@ -3440,7 +3628,12 @@ sub_pass:'Sub password (optional)', one_shot:'One-shot link', clone:'Clone', sta
 clash:'Clash', singbox:'sing-box', extra_hosts:'Extra domains (one per line)', extra_hosts_h:'Domains pointed at this Worker. Pick one when building configs.',
 tg_2fa:'Telegram 2FA login', tg_2fa_h:'After password, a 6-digit code is sent to the bot.', otp:'Telegram code', otp_h:'Enter the 6-digit code from the bot.',
 proxy_ips:'Outbound proxy', proxy_ips_h:'These IPs are NOT put in the config link. After you connect, the Worker sends traffic via these proxies (helps with sites like ChatGPT that block direct Worker IPs). Empty = direct.',
-backup_hosts:'Backup workers (one domain per line)', backup_hosts_h:'Extra VLESS hostnames on THIS same Worker. A second Worker with its own D1 will not sync.',
+backup_hosts:'Backup workers (one domain per line)', backup_hosts_h:'Shown after save for building configs. Visiting a backup domain never puts that host in links — the main panel host is always used.',
+panel_host:'Main config domain', panel_host_h:'This hostname is written into VLESS links. Do not put a backup domain here.',
+extra_ports:'Extra ports', extra_ports_h:'Ports besides the defaults. Configs on removed ports are disabled, not deleted.',
+backup_none:'No backup domains saved yet.',
+online:'Online', offline:'Offline', last_conn:'Last connect',
+
 ips_best:'Tick 5 best',
 vpn_ip_test:'Ping these IPs', vpn_ip_direct:'No proxy (direct Worker egress)',
 remark:'Display name (optional)', remark_h:'Empty = country + random name, e.g. NL 7sb5v',
@@ -3744,7 +3937,7 @@ function locSelect(name){
   return h('<select name="', name, '">', o, '</select>');
 }
 function portBoxes(name, multi, selected){
-  var on = (S.meta && S.meta.ports && S.meta.ports.length) ? S.meta.ports : [80,443,8080,8880,2052,2082,2086,2095,2053,2083];
+  var on = (S.meta && S.meta.ports && S.meta.ports.length) ? S.meta.ports : [80,8080,2052,443];
   selected = selected || [];
   var seln = [];
   var si;
@@ -3769,6 +3962,7 @@ function pickedPorts(f, name){
   return out;
 }
 function shell(content){
+  stopVpnAlivePoll();
   var u = S.status && S.status.user ? S.status.user.username : '';
   document.getElementById('app').innerHTML = h(
     '<div class="shell">',
@@ -3927,6 +4121,7 @@ function viewVpn(){
         '<div class="row" style="justify-content:space-between">',
         '<div><b>', esc(pr.name), '</b> ', pr.location ? h('<span class="pill">', esc(pr.location), '</span>') : '',
         ' <span class="pill">', esc(String(pr.port||443)), '</span>',
+        '<span class="alive-wrap"><span class="alive-box ', pr.online ? 'on' : 'off', '" data-act="alive-tip" data-alive-id="', pr.id, '" data-last="', esc(pr.last_h || ''), '">', esc(pr.online ? t('online') : t('offline')), '</span><span class="alive-tip">', esc(t('last_conn')), ': ', esc(pr.last_h || '—'), '</span></span>',
         '<div class="muted" style="font-size:12px;margin-top:6px">', esc(pr.used_h), ' / ', esc(pr.quota_h), ' · ', esc(exp), '</div></div>',
         pr.alive ? '<span class="pill ok">' + esc(t('vpn_on')) + '</span>' : '<span class="pill bad">' + esc(t('vpn_off')) + '</span>',
         '</div>',
@@ -3950,10 +4145,37 @@ function viewVpn(){
       '<div><span class="pill">2</span><span>', esc(t('vpn_h2')), '</span></div>',
       '<div><span class="pill">3</span><span>', esc(t('vpn_h3')), '</span></div></div>',
       '<div class="muted mono" style="margin-top:10px;font-size:11px">', esc((d.proxy && d.proxy.host) || ''), ' · ', esc((d.proxy && d.proxy.path) || ''), '</div></div>',
+      (d.hosts && d.hosts.length ? h('<div class="host-chips" style="margin:0 0 12px">', d.hosts.map(function(hh){ return h('<span class="pill">', esc(hh), '</span>'); }).join(''), '</div>') : ''),
       '<div class="vpn-grid">', cards || h('<div class="card" style="padding:18px"><span class="muted">', esc(t('empty')), '</span></div>'), '</div>',
       '<div id="modal"></div>'
     ));
+    startVpnAlivePoll();
   });
+}
+
+function stopVpnAlivePoll(){
+  if (S.vpnAliveT) { clearInterval(S.vpnAliveT); S.vpnAliveT = 0; }
+}
+function paintAlive(p){
+  var el = document.querySelector('[data-alive-id="' + p.id + '"]');
+  if (!el) return;
+  el.className = 'alive-box ' + (p.online ? 'on' : 'off');
+  el.textContent = p.online ? t('online') : t('offline');
+  el.setAttribute('data-last', p.last_h || '');
+  var tip = el.parentNode && el.parentNode.querySelector('.alive-tip');
+  if (tip) tip.textContent = t('last_conn') + ': ' + (p.last_h || '—');
+}
+function refreshVpnAlive(){
+  if (S.view !== '/vpn') return;
+  api('/api/vpn/alive').then(function(d){
+    if (!d.ok || !d.peers) return;
+    var i;
+    for (i = 0; i < d.peers.length; i++) paintAlive(d.peers[i]);
+  });
+}
+function startVpnAlivePoll(){
+  stopVpnAlivePoll();
+  S.vpnAliveT = setInterval(refreshVpnAlive, 60000);
 }
 
 function viewSub(){
@@ -4253,7 +4475,7 @@ function viewSettings(){
       '<p class="hint">', esc(t('ports_h')), '</p>',
       (function(){
         var on = String(s.cf_ports || '').split(',').map(function(x){return x.trim();}).filter(Boolean);
-        var all = [80,8080,8880,2052,2082,2086,2095,443,2053,2083];
+        var all = [80,8080,2052,443];
         if (!on.length) on = all.map(String);
         var html = '<div class="chkgrid" style="margin-bottom:14px">';
         var i, p;
@@ -4263,6 +4485,7 @@ function viewSettings(){
         }
         return html + '</div>';
       })(),
+      '<div class="field"><label>', esc(t('extra_ports')), '</label><input class="input" name="extra_ports" placeholder="2083,2053" value="', esc(s.extra_ports || ''), '"><div class="hint">', esc(t('extra_ports_h')), '</div></div>',
       '<h3 style="margin:8px 0 12px">', esc(t('proxy_ips')), '</h3>',
       '<p class="hint">', esc(t('proxy_ips_h')), '</p>',
       '<div class="field"><textarea class="input" name="proxy_ips" rows="8" placeholder="104.16.1.1">', esc(s.proxy_ips || ''), '</textarea></div>',
@@ -4271,7 +4494,8 @@ function viewSettings(){
       '<button class="btn" type="button" data-act="ips-ping">', esc(t('ips_ping')), '</button>',
       '<button class="btn" type="button" data-act="ips-best">', esc(t('ips_best')), '</button>',
       '</div>',
-      '<div class="field"><label>', esc(t('backup_hosts')), '</label><textarea class="input" name="backup_hosts" rows="3" placeholder="ham2.example.com">', esc(s.backup_hosts || ''), '</textarea><div class="hint">', esc(t('backup_hosts_h')), '</div></div>',
+      '<div class="field"><label>', esc(t('panel_host')), '</label><input class="input" name="panel_host" placeholder="xxx.workers.dev" value="', esc(s.panel_host || ''), '"><div class="hint">', esc(t('panel_host_h')), '</div></div>',
+      '<div class="field"><label>', esc(t('backup_hosts')), '</label><textarea class="input" name="backup_hosts" rows="3" placeholder="ham2.example.com">', esc(s.backup_hosts || ''), '</textarea><div class="hint">', esc(t('backup_hosts_h')), '</div><div id="backup-chips" class="host-chips"></div></div>',
       '<div class="hint">', esc(t('ips_pick')), '</div>',
       '<div id="ip-pick" style="margin:8px 0 14px"></div>',
       '<button class="btn primary" type="submit">', esc(t('save')), '</button>',
@@ -4280,6 +4504,18 @@ function viewSettings(){
     S.ipOn = String(s.proxy_ips_on || '').split(/[\s,]+/).filter(Boolean);
     S.ipPing = S.ipPing || {};
     syncIpPick();
+    function paintBackupChips(){
+      var box = document.getElementById('backup-chips');
+      var ta = document.querySelector('[name=backup_hosts]');
+      if (!box) return;
+      var raw = ta ? ta.value : (s.backup_hosts || '');
+      var arr = String(raw || '').split(/[\n,\s]+/).map(function(x){ return x.trim(); }).filter(Boolean);
+      if (!arr.length) { box.innerHTML = h('<span class="muted">', esc(t('backup_none')), '</span>'); return; }
+      box.innerHTML = arr.map(function(hh){ return h('<span class="pill">', esc(hh), '</span>'); }).join('');
+    }
+    paintBackupChips();
+    var bta = document.querySelector('[name=backup_hosts]');
+    if (bta) bta.addEventListener('input', paintBackupChips);
   });
 }
 
@@ -4517,6 +4753,11 @@ document.getElementById('app').addEventListener('click', function(e){
     return;
   }
   if (act === 'vpn-copy'){ copyText(b.getAttribute('data-link') || ''); return; }
+  if (act === 'alive-tip'){
+    var wrap = b.closest('.alive-wrap');
+    if (wrap) wrap.classList.toggle('open');
+    return;
+  }
   if (act === 'vpn-qr'){
     var qlink = b.getAttribute('data-link') || '';
     var qel = document.getElementById('modal');
@@ -4708,6 +4949,8 @@ document.getElementById('app').addEventListener('submit', function(e){
       payload.proxy_ips_on = Array.prototype.map.call(document.querySelectorAll('[name=proxy_ip_on]:checked'), function(c){ return c.value; }).join('\n');
     }
     if (fd.get('backup_hosts') != null) payload.backup_hosts = fd.get('backup_hosts') || '';
+    if (fd.get('extra_ports') != null) payload.extra_ports = fd.get('extra_ports') || '';
+    if (fd.get('panel_host') != null) payload.panel_host = fd.get('panel_host') || '';
     api('/api/settings','PUT', payload).then(function(r){
       if (!r.ok) toast(r.error||t('err'), true); else { toast(t('saved')); boot(); }
     });
