@@ -1,16 +1,6 @@
 /**
- * Ham — Cloudflare Worker Control Panel
+ * Ham — panel for create VPN free
  * Author: Hamb4
- *
- * تک‌فایل. همین را در Cloudflare Dashboard داخل Worker پیست کنید و Deploy کنید.
- *
- * Binding اجباری:
- *   Settings → Bindings → Add → D1 Database
- *   Variable name باید دقیقاً باشد: DB
- *
- * اگر D1 وصل نباشد ویزارد راه‌اندازی قفل می‌شود و جلو نمی‌رود.
- * تونل فیلترشکن روی خود ورکر است (VLESS+WS+TLS) و به API Token نیاز ندارد.
- * Compatibility date را در داشبورد ۲۰۲۴-۰۹-۰۱ یا جدیدتر بگذارید.
  */
 
 import { connect } from 'cloudflare:sockets';
@@ -4994,9 +4984,17 @@ boot();
 
 export default {
   async fetch(request, env, ctx) {
-    return handleRequest(request, env, ctx);
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (e) {
+      var msg = String((e && e.stack) || (e && e.message) || e);
+      return new Response('Ham error\n' + msg, {
+        status: 500,
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
+      });
+    }
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleCron(env, ctx));
+    try { ctx.waitUntil(handleCron(env, ctx)); } catch (eC) {}
   }
 };
