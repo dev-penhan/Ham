@@ -7,6 +7,8 @@ import { connect } from 'cloudflare:sockets';
 
 var VPN_SCHEMA_OK = false;
 var VPN_PATH_MEM = '/vpnws';
+var RUNTIME_ENV = null;
+var CAMO_URL = 'https://ubuntu.com/';
 
 const SCHEMA =
   'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);' +
@@ -120,6 +122,65 @@ function clientIp(request) {
   var ip = (request.headers.get('CF-Connecting-IP') || '').trim();
   if (!ip) ip = (request.headers.get('CF-Connecting-IPv6') || '').trim();
   return ip || '0.0.0.0';
+}
+
+function parseAllowList(s) {
+  var parts = String(s || '').split(/[\n,]+/);
+  var out = [];
+  var i, x;
+  for (i = 0; i < parts.length; i++) {
+    x = parts[i].trim();
+    if (!x || x.charAt(0) === '#') continue;
+    if (!/^[0-9a-fA-F.:/]+$/.test(x)) continue;
+    if (out.indexOf(x) === -1) out.push(x);
+  }
+  return out;
+}
+
+function ipv4Num(ip) {
+  var p = String(ip || '').split('.');
+  if (p.length !== 4) return null;
+  var n = 0, i, o;
+  for (i = 0; i < 4; i++) {
+    o = parseInt(p[i], 10);
+    if (!(o >= 0 && o <= 255)) return null;
+    n = (n * 256) + o;
+  }
+  return n;
+}
+
+function ipAllowed(ip, list) {
+  if (!list || !list.length) return true;
+  ip = String(ip || '');
+  var i, rule, slash, base, bits, n, mask, rn;
+  for (i = 0; i < list.length; i++) {
+    rule = list[i];
+    if (rule === ip) return true;
+    slash = rule.indexOf('/');
+    if (slash === -1) continue;
+    base = rule.slice(0, slash);
+    bits = parseInt(rule.slice(slash + 1), 10);
+    n = ipv4Num(ip);
+    rn = ipv4Num(base);
+    if (n == null || rn == null || !(bits >= 0 && bits <= 32)) continue;
+    mask = bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0;
+    if ((n >>> 0 & mask) === (rn >>> 0 & mask)) return true;
+  }
+  return false;
+}
+
+async function panelAllow(env, request) {
+  if (!hasDB(env)) return true;
+  try {
+    if ((await settingGet(env.DB, 'access_only')) === '1') {
+      if (!request.headers.get('CF-Access-Jwt-Assertion')) return false;
+    }
+    var list = parseAllowList(await settingGet(env.DB, 'allow_ips'));
+    if (!list.length) return true;
+    return ipAllowed(clientIp(request), list);
+  } catch (e) {
+    return true;
+  }
 }
 
 function hasDB(env) {
@@ -272,9 +333,14 @@ async function installKey(db) {
   return k;
 }
 
-async function wrapCryptoKey(db) {
-  var inst = await installKey(db);
-  var raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('HamWrap.v1|' + inst));
+async function wrapCryptoKey(db, useEnv) {
+  var material;
+  if (useEnv && RUNTIME_ENV && RUNTIME_ENV.HAM_KEY) material = 'HamWrap.v1|env|' + String(RUNTIME_ENV.HAM_KEY);
+  else {
+    var inst = await installKey(db);
+    material = 'HamWrap.v1|' + inst;
+  }
+  var raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material));
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
@@ -283,7 +349,7 @@ async function secretSeal(db, plain) {
   if (!plain) return '';
   if (plain.indexOf('enc:v1:') === 0) return plain;
   try {
-    var key = await wrapCryptoKey(db);
+    var key = await wrapCryptoKey(db, !!(RUNTIME_ENV && RUNTIME_ENV.HAM_KEY));
     var iv = crypto.getRandomValues(new Uint8Array(12));
     var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(plain));
     var mixed = new Uint8Array(12 + ct.byteLength);
@@ -303,8 +369,17 @@ async function secretOpen(db, val) {
     if (!bin || bin.length < 13) return '';
     var iv = bin.slice(0, 12);
     var ct = bin.slice(12);
-    var key = await wrapCryptoKey(db);
-    var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct);
+    var pt = null;
+    try {
+      if (RUNTIME_ENV && RUNTIME_ENV.HAM_KEY) {
+        var k1 = await wrapCryptoKey(db, true);
+        pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, k1, ct);
+      }
+    } catch (eE) { pt = null; }
+    if (!pt) {
+      var k2 = await wrapCryptoKey(db, false);
+      pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, k2, ct);
+    }
     return new TextDecoder().decode(pt);
   } catch (e) {
     return '';
@@ -357,45 +432,70 @@ async function usdTomanRate() {
 
 async function cfJson(token, path) {
   var ctrl = new AbortController();
-  var tid = setTimeout(function () { try { ctrl.abort(); } catch (eA) {} }, 4000);
+  var tid = setTimeout(function () { try { ctrl.abort(); } catch (eA) {} }, 5000);
   try {
     var r = await fetch('https://api.cloudflare.com/client/v4' + path, {
-      headers: { Authorization: 'Bearer ' + token },
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
       signal: ctrl.signal
     });
     clearTimeout(tid);
-    return await r.json();
+    var j = await r.json().catch(function () { return null; });
+    return j || { success: false, errors: [{ message: 'HTTP ' + r.status }] };
   } catch (e) {
     try { clearTimeout(tid); } catch (e2) {}
-    return null;
+    return { success: false, errors: [{ message: String(e && e.message ? e.message : e) }] };
   }
+}
+
+function cfErr(j) {
+  if (!j) return 'no response';
+  if (j.errors && j.errors[0] && j.errors[0].message) return String(j.errors[0].message);
+  return 'Cloudflare API error';
+}
+
+function flattenUsageRows(result) {
+  if (!result) return [];
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result.rows)) return result.rows;
+  if (Array.isArray(result.data)) return result.data;
+  if (Array.isArray(result.items)) return result.items;
+  return [];
 }
 
 async function cfAccountMoney(db) {
   var out = { ok: false, used_h: '', left_h: '—', err: 'no_token' };
   var token = '';
   try { token = String(await settingGet(db, 'cf_token') || '').trim(); } catch (e0) {}
+  if (token.indexOf('Bearer ') === 0) token = token.slice(7).trim();
   if (!token || token === '-') return out;
-  var acc = await cfJson(token, '/accounts?per_page=5');
+  var d = new Date();
+  var mm = String(d.getUTCMonth() + 1);
+  if (mm.length < 2) mm = '0' + mm;
+  var dd = String(d.getUTCDate());
+  if (dd.length < 2) dd = '0' + dd;
+  var from = d.getUTCFullYear() + '-' + mm + '-01';
+  var to = d.getUTCFullYear() + '-' + mm + '-' + dd;
+  var acc = await cfJson(token, '/accounts?per_page=20');
   if (!acc || !acc.success || !acc.result || !acc.result.length) {
-    out.err = 'token';
+    var v = await cfJson(token, '/user/tokens/verify');
+    out.err = cfErr(acc) + (v && v.success ? ' — Billing/Account Read لازم است' : ' — توکن نامعتبر');
+    out.used_h = out.err;
     return out;
   }
   var id = acc.result[0].id;
   var usedUsd = 0;
-  var usage = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billable-usage');
-  if (usage && usage.success && usage.result) {
-    var rows = Array.isArray(usage.result) ? usage.result : [];
-    var i, row, key, cum, map = {};
-    for (i = 0; i < rows.length; i++) {
-      row = rows[i] || {};
-      key = String(row.ServiceName || row.service_name || ('r' + i));
-      cum = pickNum(row.CumulatedContractedCost, row.cumulated_contracted_cost, row.ContractedCost, row.contracted_cost);
-      if (cum == null) continue;
-      if (map[key] == null || cum > map[key]) map[key] = cum;
-    }
-    for (key in map) if (Object.prototype.hasOwnProperty.call(map, key)) usedUsd += map[key];
+  var usage = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billable-usage?from=' + from + '&to=' + to);
+  if (!usage || !usage.success) usage = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billable-usage');
+  var rows = flattenUsageRows(usage && usage.result);
+  var i, row, key, cum, map = {};
+  for (i = 0; i < rows.length; i++) {
+    row = rows[i] || {};
+    key = String(row.ServiceName || row.service_name || row.product || ('r' + i));
+    cum = pickNum(row.CumulatedContractedCost, row.cumulated_contracted_cost, row.ContractedCost, row.contracted_cost, row.cost, row.amount);
+    if (cum == null) continue;
+    if (map[key] == null || cum > map[key]) map[key] = cum;
   }
+  for (key in map) if (Object.prototype.hasOwnProperty.call(map, key)) usedUsd += map[key];
   var leftUsd = null;
   var cr = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billing/credits');
   if (cr && cr.success && cr.result != null) {
@@ -405,21 +505,19 @@ async function cfAccountMoney(db) {
       var s = 0;
       for (i = 0; i < res.length; i++) s += Number(pickNum(res[i].remaining, res[i].amount, res[i].balance, res[i].credit) || 0);
       leftUsd = s;
-    } else {
-      leftUsd = pickNum(res.remaining, res.balance, res.amount, res.available, res.credit);
-    }
+    } else leftUsd = pickNum(res.remaining, res.balance, res.amount, res.available, res.credit, res.total);
   }
   if (leftUsd == null) {
-    var pr = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billing/profile');
+    var pr = await cfJson(token, '/user/billing/profile');
     if (pr && pr.success && pr.result) leftUsd = pickNum(pr.result.balance, pr.result.credit, pr.result.account_balance);
   }
-  var rate = await usdTomanRate();
+  var rate = 100000;
   out.ok = true;
   out.err = '';
   out.used_usd = usedUsd;
   out.left_usd = leftUsd;
-  out.used_h = fmtToman(usedUsd * rate);
-  out.left_h = leftUsd == null ? '—' : fmtToman(leftUsd * rate);
+  out.used_h = fmtToman(usedUsd * rate) + (usedUsd ? ' (' + usedUsd.toFixed(2) + ' $)' : '');
+  out.left_h = leftUsd == null ? '—' : (fmtToman(leftUsd * rate) + ' (' + Number(leftUsd).toFixed(2) + ' $)');
   return out;
 }
 
@@ -437,7 +535,7 @@ async function authUser(env, request) {
     await ensureSessionCols(env.DB);
     var row = await dbFirst(
       env.DB,
-      'SELECT s.token, s.expires_at, s.csrf, u.id, u.username, u.role, u.email, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
+      'SELECT s.token, s.expires_at, s.csrf, s.ip AS sip, s.ua AS sua, u.id, u.username, u.role, u.email, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
       token
     );
     if (!row) return null;
@@ -446,6 +544,12 @@ async function authUser(env, request) {
       return null;
     }
     if (!row.active) return null;
+    var nowIp = clientIp(request);
+    var nowUa = (request.headers.get('User-Agent') || '').slice(0, 180);
+    if (row.sip && row.sua && row.sip !== nowIp && row.sua !== nowUa) {
+      await dbRun(env.DB, 'DELETE FROM sessions WHERE token = ?', token);
+      return null;
+    }
     if (!row.csrf) {
       row.csrf = randomToken();
       try { await dbRun(env.DB, 'UPDATE sessions SET csrf = ? WHERE token = ?', row.csrf, token); } catch (eCsrf) {}
@@ -812,13 +916,19 @@ async function tgSend(env, ctx, text) {
     var chats = rawChat.split(/[\s,]+/).filter(Boolean);
     var i, ok = false, res, body;
     for (i = 0; i < chats.length; i++) {
-      res = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: chats[i], text: String(text || '').slice(0, 3500) })
-      });
-      body = await res.text();
-      if (res.ok && body.indexOf('"ok":true') !== -1) ok = true;
+      var ctrl = new AbortController();
+      var tid = setTimeout(function () { try { ctrl.abort(); } catch (eA) {} }, 3500);
+      try {
+        res = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: chats[i], text: String(text || '').slice(0, 3500) }),
+          signal: ctrl.signal
+        });
+        body = await res.text();
+        if (res.ok && body.indexOf('"ok":true') !== -1) ok = true;
+      } catch (eT) {}
+      try { clearTimeout(tid); } catch (eC) {}
     }
     return ok;
   } catch (e) {
@@ -1581,6 +1691,21 @@ async function runTunnel(ws, env, ctx, ip, pump, early) {
       try {
         if (meter.kind === 'sub') await dbRun(env.DB, 'UPDATE vpn_subs SET used_bytes = used_bytes + ? WHERE id = ?', meter.n, meter.id);
         else await dbRun(env.DB, 'UPDATE vpn_peers SET used_bytes = used_bytes + ? WHERE id = ?', meter.n, meter.id);
+        try {
+          if (meter.kind !== 'sub') {
+            var abuseGb = parseInt(await settingGet(env.DB, 'abuse_gb'), 10);
+            if (isNaN(abuseGb)) abuseGb = 80;
+            if (abuseGb > 0) {
+              var day = new Date().toISOString().slice(0, 10);
+              var du = await dbFirst(env.DB, 'SELECT bytes FROM vpn_usage WHERE day = ? AND kind = ? AND owner_id = ?', day, 'peer', meter.id);
+              var dayN = (du ? Number(du.bytes) : 0) + meter.n;
+              if (dayN >= abuseGb * 1024 * 1024 * 1024) {
+                await dbRun(env.DB, 'UPDATE vpn_peers SET enabled = 0 WHERE id = ?', meter.id);
+                try { await tgSend(env, ctx, 'کانفیگ پرمصرف خاموش شد (#' + meter.id + ') ' + fmtBytes(dayN) + ' امروز'); } catch (eAb) {}
+              }
+            }
+          }
+        } catch (eAbuse) {}
         await addDaily(env.DB, meter.n, meter.kind, meter.id);
         var row = meter.kind === 'sub'
           ? await dbFirst(env.DB, 'SELECT * FROM vpn_subs WHERE id = ?', meter.id)
@@ -1750,7 +1875,23 @@ async function handleApi(request, env, url) {
     var twofa = await settingGet(env.DB, 'tg_2fa');
     var tgTok = await settingGet(env.DB, 'tg_token');
     var tgChat = await settingGet(env.DB, 'tg_chat');
-    if (twofa === '1' && tgTok && tgChat) {
+    var adminN = 0;
+    try {
+      var acn = await dbFirst(env.DB, "SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND active = 1");
+      adminN = Number(acn && acn.c) || 0;
+    } catch (eAd) {}
+    var force2fa = twofa === '1' || adminN > 1;
+    var loginCountry = (request.cf && request.cf.country) || '';
+    var loginAsn = String((request.cf && request.cf.asn) || '');
+    try {
+      var prevMeta = JSON.parse((await settingGet(env.DB, 'login_meta')) || '{}') || {};
+      if ((prevMeta.country && loginCountry && prevMeta.country !== loginCountry) || (prevMeta.asn && loginAsn && prevMeta.asn !== loginAsn)) {
+        try { await tgSend(env, null, 'ورود غیرعادی Ham\nIP: ' + ip + '\nکشور: ' + loginCountry + '\nASN: ' + loginAsn); } catch (eAn) {}
+        await new Promise(function (r) { setTimeout(r, 1600); });
+      }
+      await settingSet(env.DB, 'login_meta', JSON.stringify({ country: loginCountry, asn: loginAsn, at: nowIso() }));
+    } catch (eMeta) {}
+    if (force2fa && tgTok && tgChat) {
       var code = String(Math.floor(100000 + Math.random() * 900000));
       var ot = randomToken().slice(0, 24);
       var exp2 = new Date(Date.now() + 5 * 60 * 1000).toISOString();
@@ -1761,8 +1902,16 @@ async function handleApi(request, env, url) {
         await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
       }
       var sent = await tgSend(env, null, '🔐 کد ورود Ham:\n' + code + '\nاعتبار: ۵ دقیقه');
-      if (!sent) return deny('کد به تلگرام نرفت. توکن بات و Chat ID را در تنظیمات چک کنید.', 502);
-      return json({ ok: true, need_2fa: true, tmp: ot });
+      if (!sent) {
+        var allow = parseAllowList(await settingGet(env.DB, 'allow_ips'));
+        if (allow.length && ipAllowed(ip, allow)) {
+          try { await tgSend(env, null, 'ورود اضطراری بدون ۲FA از IP مجاز: ' + ip); } catch (eEm) {}
+        } else {
+          return deny('کد به تلگرام نرفت. توکن بات و Chat ID را چک کنید.', 502);
+        }
+      } else {
+        return json({ ok: true, need_2fa: true, tmp: ot });
+      }
     }
     await dbRun(env.DB, 'UPDATE users SET last_login = ? WHERE id = ?', nowIso(), user.id);
     var hours = (lb && (lb.remember === true || lb.remember === 1 || lb.remember === '1')) ? (7 * 24) : 2;
@@ -1859,6 +2008,35 @@ async function handleApi(request, env, url) {
     };
     var cfMoney = { ok: false, used_h: '', left_h: '—' };
     try { cfMoney = await cfAccountMoney(env.DB); } catch (eCf) {}
+    try {
+      var alpeers = await dbAll(env.DB, 'SELECT * FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 LIMIT 80');
+      var ap;
+      for (ap = 0; ap < alpeers.length; ap++) {
+        try { await maybeAlert(env, ctx, alpeers[ap], 'peer'); } catch (eAl) {}
+      }
+    } catch (eScan) {}
+    var health = [];
+    try {
+      var bhs = parseHostLines(await settingGet(env.DB, 'backup_hosts'));
+      var hi, hst, t0, hr;
+      for (hi = 0; hi < bhs.length && hi < 6; hi++) {
+        hst = bhs[hi];
+        t0 = Date.now();
+        try {
+          hr = await Promise.race([
+            fetch('https://' + hst + '/cdn-cgi/trace', { method: 'GET', redirect: 'manual' }),
+            new Promise(function (res) { setTimeout(function () { res(null); }, 2500); })
+          ]);
+          health.push({ host: hst, ok: !!(hr && (hr.status || 0) < 500), ms: Date.now() - t0 });
+        } catch (eH) {
+          health.push({ host: hst, ok: false, ms: Date.now() - t0 });
+        }
+      }
+    } catch (eHh) {}
+    try {
+      var can = await settingGet(env.DB, 'canary');
+      if (!can) await settingSet(env.DB, 'canary', randomToken());
+    } catch (eCan) {}
     return json({
       ok: true,
       users: (uc && uc.c) || 0,
@@ -1872,6 +2050,7 @@ async function handleApi(request, env, url) {
       subs: (scount && scount.c) || 0,
       loc: loc,
       cf_money: cfMoney,
+      health: health,
       daily: daily,
       cfgs: (await dbAll(env.DB, 'SELECT id, name, used_bytes, quota_bytes, expire_at, enabled, location FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 ORDER BY id DESC LIMIT 40')).map(function (row) {
         var q = Number(row.quota_bytes) || 0;
@@ -2013,6 +2192,9 @@ async function handleApi(request, env, url) {
         tg_token: await settingGet(env.DB, 'tg_token'),
         tg_chat: await settingGet(env.DB, 'tg_chat'),
         cf_token_set: (await settingGet(env.DB, 'cf_token')) ? '1' : '0',
+        allow_ips: await settingGet(env.DB, 'allow_ips'),
+        abuse_gb: (await settingGet(env.DB, 'abuse_gb')) || '80',
+        access_only: (await settingGet(env.DB, 'access_only')) === '1' ? '1' : '0',
         theme: (await settingGet(env.DB, 'theme')) === 'dark' ? 'dark' : 'light',
         extra_hosts: await settingGet(env.DB, 'extra_hosts'),
         proxy_ips: await settingGet(env.DB, 'proxy_ips'),
@@ -2031,9 +2213,9 @@ async function handleApi(request, env, url) {
     if (typeof sb.panel_name === 'string' && sb.panel_name.trim()) await settingSet(env.DB, 'panel_name', sb.panel_name.trim().slice(0, 40));
     if (sb.lang === 'fa' || sb.lang === 'en') await settingSet(env.DB, 'lang', sb.lang);
     if (typeof sb.vpn_path === 'string') await settingSet(env.DB, 'vpn_path', normPath(sb.vpn_path));
-    if (typeof sb.camouflage_url === 'string' && /^https?:\/\//.test(sb.camouflage_url.trim())) {
-      await settingSet(env.DB, 'camouflage_url', sb.camouflage_url.trim());
-    }
+    if (typeof sb.allow_ips === 'string') await settingSet(env.DB, 'allow_ips', sb.allow_ips);
+    if (typeof sb.abuse_gb === 'string' || typeof sb.abuse_gb === 'number') await settingSet(env.DB, 'abuse_gb', String(parseInt(sb.abuse_gb, 10) || 0));
+    if (sb.access_only === '1' || sb.access_only === '0') await settingSet(env.DB, 'access_only', sb.access_only);
     if (typeof sb.panel_path === 'string' && sb.panel_path.trim()) {
       var npp = normPath(sb.panel_path);
       if (npp !== '/sub' && npp !== '/api') await settingSet(env.DB, 'panel_path', npp);
@@ -2376,9 +2558,36 @@ async function handleApi(request, env, url) {
     return json({ ok: true, peers: al });
   }
 
+  if (path === '/api/vpn.csv' && method === 'GET') {
+    await ensureVpn(env.DB);
+    var exp = await dbAll(env.DB, 'SELECT id, name, location, used_bytes, quota_bytes, expire_at, enabled, last_seen, created_at FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 ORDER BY id DESC');
+    var lines = ['id,name,location,used_bytes,quota_bytes,expire_at,enabled,last_seen,created_at'];
+    var ei, er;
+    function csvCell(v) {
+      v = String(v == null ? '' : v);
+      if (/[",\n]/.test(v)) return '"' + v.replace(/"/g, '""') + '"';
+      return v;
+    }
+    for (ei = 0; ei < exp.length; ei++) {
+      er = exp[ei];
+      lines.push([er.id, csvCell(er.name), csvCell(er.location), er.used_bytes || 0, er.quota_bytes || 0, csvCell(er.expire_at), er.enabled, csvCell(er.last_seen), csvCell(er.created_at)].join(','));
+    }
+    return new Response(lines.join('\n'), {
+      headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="ham-peers.csv"', 'cache-control': 'no-store' }
+    });
+  }
+
   if (path === '/api/vpn' && method === 'POST') {
     if (me.role === 'viewer') return deny('Forbidden', 403);
     await ensureVpn(env.DB);
+    try {
+      var since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      var burst = await dbFirst(env.DB, 'SELECT COUNT(*) AS c FROM vpn_peers WHERE created_at >= ?', since);
+      if (burst && Number(burst.c) >= 12) {
+        try { await tgSend(env, null, 'قفل موقت: ساخت زیاد کانفیگ از پنل. IP ' + ip); } catch (eB) {}
+        return deny('ساخت کانفیگ موقتاً قفل شد', 429);
+      }
+    } catch (eF) {}
     var vb = (await readJson(request)) || {};
     var vname = String(vb.name || 'Ham').trim().slice(0, 40) || 'Ham';
     var vuuid = String(vb.uuid || '').trim().toLowerCase() || crypto.randomUUID();
@@ -3334,7 +3543,18 @@ async function handleStatus(request, env, url) {
 
 async function handleCron(env, ctx) {
   if (!hasDB(env)) return;
+  RUNTIME_ENV = env;
   await ensureVpn(env.DB);
+  try {
+    var can = await settingGet(env.DB, 'canary');
+    if (!can) await settingSet(env.DB, 'canary', randomToken());
+    else {
+      var raw = await dbFirst(env.DB, 'SELECT value FROM settings WHERE key = ?', 'canary');
+      if (!raw || !raw.value) {
+        try { await tgSend(env, ctx, 'هشدار canary: ردیف تله در settings نیست'); } catch (eCy) {}
+      }
+    }
+  } catch (eC0) {}
   var token = await settingGet(env.DB, 'tg_token');
   var chat = await settingGet(env.DB, 'tg_chat');
   if (!token || !chat) return;
@@ -3384,6 +3604,7 @@ async function handleRequest(request, env, ctx) {
       if (pp) panel = normPath(pp);
       var cu = await settingGet(env.DB, 'camouflage_url');
       if (cu && /^https?:\/\//.test(cu)) camouflage = cu;
+      else camouflage = CAMO_URL;
     } catch (e) {}
   }
   if (url.pathname.indexOf('/sub/') === 0) {
@@ -3394,6 +3615,10 @@ async function handleRequest(request, env, ctx) {
   }
   if (url.pathname === '/hamtg' || url.pathname === '/hamtg/') {
     try { return await handleTelegram(request, env, url); } catch (e) { return json({ ok: true }); }
+  }
+  var onPanel = url.pathname === panel || url.pathname === panel + '/' || url.pathname.indexOf(panel + '/') === 0;
+  if (onPanel && !(await panelAllow(env, request))) {
+    return Response.redirect(camouflage, 302);
   }
   var apiPrefix = panel + '/api/';
   if (url.pathname.indexOf(apiPrefix) === 0) {
@@ -3673,6 +3898,11 @@ cf_tok:'توکن API کلادفلر',
 cf_hint:'توکن با دسترسی Billing Read. مصرف و ماندهٔ حساب را در داشبورد نشان می‌دهد.',
 cf_spend:'مصرف', cf_left:'مانده', cf_no_tok:'توکن کلادفلر را در تنظیمات بگذارید',
 cf_tok_saved:'توکن ذخیره است. برای عوض کردن، توکن جدید بنویسید.',
+allow_ips:'IPهای مجاز پنل', allow_ips_h:'خالی = همه. هر خط یک IP یا رنج مثل 1.2.3.0/24. مسیر تونل و ربات بسته نمی‌شود.',
+abuse_gb:'قطع خودکار حجم غیرعادی (گیگ در روز)', abuse_gb_h:'۰ = خاموش. اگر مصرف یک کانفیگ در یک روز از این بیشتر شود خاموش می‌شود.',
+access_only:'فقط Cloudflare Access', access_only_h:'اگر Access جلوی /dash باشد این را بزنید. بدون JWT کلادفلر پنل باز نمی‌شود.',
+csv_export:'خروجی CSV مصرف',
+backup_health:'سلامت ورکر پشتیبان',
 
 cf_how:'اگر الان کلید ندارید «فعلاً رد کن» را بزنید. بعداً از صفحه تنظیمات داخل پنل هم می‌توانید بگذارید.',
 cf_steps:'ساخت کلید: در کلادفلر روی آیکون آدمک بالا راست → My Profile → API Tokens → Create Token. قالب Edit zone DNS را بردارید و دسترسی Cache Purge را هم اضافه کنید. کلید فقط یک‌بار نشان داده می‌شود؛ کپی کنید و در کادر پایین بچسبانید.',
@@ -3791,6 +4021,11 @@ cf_tok:'Cloudflare API token',
 cf_hint:'Needs Billing Read. Used on the dashboard for spend and remaining credit.',
 cf_spend:'Used', cf_left:'Left', cf_no_tok:'Add a Cloudflare token in Settings',
 cf_tok_saved:'Token is saved. Paste a new one to replace it.',
+allow_ips:'Allowed panel IPs', allow_ips_h:'Empty = everyone. One IP or CIDR per line. Tunnel and bot stay open.',
+abuse_gb:'Auto-disable abuse (GB/day)', abuse_gb_h:'0 = off. Peers over this daily usage are turned off.',
+access_only:'Cloudflare Access only', access_only_h:'Require CF-Access JWT on /dash. Configure Access in the Cloudflare dashboard first.',
+csv_export:'Export usage CSV',
+backup_health:'Backup worker health',
 
 cf_how:'If you do not have a token now, press Skip for now. You can add it later under Settings.',
 cf_steps:'To create one: Cloudflare profile icon (top right) → My Profile → API Tokens → Create Token. Start from Edit zone DNS and also add Cache Purge. The token is shown once — copy it into the box below.',
@@ -4360,7 +4595,7 @@ function viewVpn(){
         '<div class="muted" style="font-size:12px;margin-top:6px">', esc(pr.used_h), ' / ', esc(pr.quota_h), ' · ', esc(exp), '</div></div>',
         pr.alive ? '<span class="pill ok">' + esc(t('vpn_on')) + '</span>' : '<span class="pill bad">' + esc(t('vpn_off')) + '</span>',
         '</div>',
-        vless ? h('<div class="linkbox">', esc(vless), '</div>') : '',
+        vless ? h('<div class="row" style="align-items:flex-start;gap:10px;margin-top:10px"><div class="linkbox" style="flex:1">', esc(vless), '</div><img alt="QR" width="96" height="96" style="border-radius:8px;background:#fff;flex:none" src="https://api.qrserver.com/v1/create-qr-code/?size=96x96&ecc=M&margin=4&data=', encodeURIComponent(vless), '"></div>') : '',
         '<div class="row">',
         vless ? h('<button class="btn primary" data-act="vpn-copy" data-link="', esc(vless), '">', esc(t('share')), '</button>') : '',
         vless ? h('<button class="btn" data-act="vpn-copy" data-link="', esc(vless), '">VLESS</button>') : '',
@@ -4470,7 +4705,17 @@ function viewDash(){
       '</div>',
       '<div class="card" style="margin-top:14px;padding:16px">',
       '<span class="pill ok">', esc(t('vpn_edge')), '</span> <span class="muted">', esc((d.loc && d.loc.asOrg) || 'Cloudflare'), ' · ', esc((d.loc && d.loc.colo) || ''), '</span>',
+      ' <a class="btn" href="', BASE, '/api/vpn.csv" style="margin-inline-start:8px">', esc(t('csv_export')), '</a>',
       '</div>',
+      (d.health && d.health.length ? (function(){
+        var hh = '<div class="card" style="margin-top:14px;padding:16px"><h3 style="margin-bottom:8px">' + esc(t('backup_health')) + '</h3>';
+        var i, x;
+        for (i = 0; i < d.health.length; i++){
+          x = d.health[i];
+          hh += '<div class="row" style="margin:6px 0"><span class="pill ' + (x.ok ? 'ok' : 'bad') + '">' + (x.ok ? 'OK' : 'DOWN') + '</span> <span class="mono">' + esc(x.host) + '</span> <span class="muted">' + esc(x.ms != null ? (x.ms + ' ms') : '') + '</span></div>';
+        }
+        return hh + '</div>';
+      })() : ''),
       (function(){
         var cfgs = d.cfgs || [];
         if (!cfgs.length) return '';
@@ -4686,9 +4931,11 @@ function viewSettings(){
       '<div class="field"><label>', esc(t('vpn_path')), '</label><input class="input" name="vpn_path" value="', esc(s.vpn_path || '/vpnws'), '"></div>',
             '<h3 style="margin:8px 0 12px">', esc(t('set_sec')), '</h3>',
       '<div class="field"><label>', esc(t('set_panel_path')), '</label><input class="input" name="panel_path" value="', esc(s.panel_path || '/dash'), '"><div class="hint">', esc(t('set_panel_path_h')), '</div></div>',
-      '<div class="field"><label>', esc(t('set_camo')), '</label><input class="input" name="camouflage_url" value="', esc(s.camouflage_url || 'https://ubuntu.com/'), '"><div class="hint">', esc(t('set_camo_h')), '</div></div>',
       '<h3 style="margin:8px 0 12px">', esc(t('cf')), '</h3>',
       '<div class="field"><label>', esc(t('cf_tok')), '</label><input class="input" name="cf_token" placeholder="Bearer token" value="" autocomplete="off"><div class="hint">', esc(s.cf_token_set === '1' ? t('cf_tok_saved') : t('cf_hint')), '</div></div>',
+      '<div class="field"><label>', esc(t('allow_ips')), '</label><textarea class="input" name="allow_ips" rows="3" placeholder="1.2.3.4\n5.6.7.0/24">', esc(s.allow_ips || ''), '</textarea><div class="hint">', esc(t('allow_ips_h')), '</div></div>',
+      '<div class="field"><label>', esc(t('abuse_gb')), '</label><input class="input" name="abuse_gb" type="number" min="0" value="', esc(s.abuse_gb || '80'), '"><div class="hint">', esc(t('abuse_gb_h')), '</div></div>',
+      '<label class="pill" style="margin-bottom:12px"><input type="checkbox" name="access_only"', s.access_only==='1'?' checked':'', '> ', esc(t('access_only')), '</label><div class="hint">', esc(t('access_only_h')), '</div>',
       '<h3 style="margin:8px 0 12px">', esc(t('tg')), '</h3>',
       '<p class="hint">', esc(t('tg_h')), '</p>',
       '<p class="hint">', esc(t('tg_bot')), '</p>',
@@ -5181,8 +5428,10 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (fd.get('panel_name') != null) payload.panel_name = fd.get('panel_name');
     if (fd.get('lang') != null) payload.lang = fd.get('lang');
     if (fd.get('vpn_path') != null) payload.vpn_path = fd.get('vpn_path');
-    if (fd.get('camouflage_url') != null) payload.camouflage_url = fd.get('camouflage_url');
     if (fd.get('panel_path') != null) payload.panel_path = fd.get('panel_path');
+    if (fd.get('allow_ips') != null) payload.allow_ips = fd.get('allow_ips') || '';
+    if (fd.get('abuse_gb') != null) payload.abuse_gb = fd.get('abuse_gb') || '0';
+    if (f.querySelector('[name=access_only]')) payload.access_only = f.querySelector('[name=access_only]').checked ? '1' : '0';
     if (f.querySelector('[name=cf_port]')) payload.cf_ports = pickedPorts(f, 'cf_port').join(',');
     if (fd.get('tg_token') != null) payload.tg_token = fd.get('tg_token');
     if (fd.get('tg_chat') != null) payload.tg_chat = fd.get('tg_chat');
@@ -5238,6 +5487,7 @@ boot();
 
 export default {
   async fetch(request, env, ctx) {
+    RUNTIME_ENV = env;
     try {
       return await handleRequest(request, env, ctx);
     } catch (e) {
