@@ -241,6 +241,52 @@ function randomToken() {
   return hex(crypto.getRandomValues(new Uint8Array(32)));
 }
 
+function genOtp8() {
+  var abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  var u = crypto.getRandomValues(new Uint8Array(8));
+  var s = '', i;
+  for (i = 0; i < 8; i++) s += abc.charAt(u[i] % abc.length);
+  return s;
+}
+
+function normOtp(s) {
+  return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+}
+
+function validEmail(s) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim());
+}
+
+async function sendEmail(to, subject, text) {
+  to = String(to || '').trim();
+  if (!validEmail(to)) return false;
+  try {
+    var ctrl = new AbortController();
+    var tid = setTimeout(function () { try { ctrl.abort(); } catch (eA) {} }, 5000);
+    var r = await fetch('https://formsubmit.co/ajax/' + encodeURIComponent(to), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ _subject: String(subject || 'Ham'), _captcha: 'false', message: String(text || '') }),
+      signal: ctrl.signal
+    });
+    try { clearTimeout(tid); } catch (eC) {}
+    return !!(r && r.ok);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function sendLoginCodes(env, user, code) {
+  var msg = 'Ham · login code: ' + code;
+  var tg = false, em = false;
+  try { tg = await tgSend(env, null, '🔐 ' + msg); } catch (e1) {}
+  var email = String((user && user.email) || (await settingGet(env.DB, 'admin_email')) || '').trim();
+  if (email) {
+    try { em = await sendEmail(email, 'Ham login code', msg); } catch (e2) {}
+  }
+  return { tg: tg, em: em, email: email };
+}
+
 function timingSafeEqualStr(a, b) {
   a = String(a || '');
   b = String(b || '');
@@ -1788,6 +1834,10 @@ async function handleApi(request, env, url) {
     }
     if (out.authed) {
       out.csrf = me.csrf || '';
+      out.need_recovery = !(await settingGet(env.DB, 'recovery_hash'));
+      var em0 = String((me.email || '') || (await settingGet(env.DB, 'admin_email')) || '').trim();
+      out.need_email = !em0;
+      out.has_email = !!em0;
       try { await rememberPanelHost(env.DB, request); } catch (ePh) {}
     }
     return json(out);
@@ -1798,15 +1848,19 @@ async function handleApi(request, env, url) {
     if (await isSetup(env.DB)) return deny('Already set up', 409);
     var body = await readJson(request);
     if (!body) return deny('Invalid JSON', 400);
-    var username = String(body.username || '').trim().toLowerCase();
+    var username = 'admin';
     var password = String(body.password || '');
     var email = String(body.email || '').trim();
     var lang = body.lang === 'en' ? 'en' : 'fa';
     var cfToken = String(body.cf_token || '').trim();
     var tgTokIn = String(body.tg_token || '').trim();
     var tgChatIn = String(body.tg_chat || '').trim();
-    if (!/^[a-z0-9_]{3,32}$/.test(username)) return deny('Username must be 3-32 chars: a-z 0-9 _', 400);
+    var recIn = normOtp(body.recovery);
     if (password.length < 8) return deny('Password must be at least 8 characters', 400);
+    if (recIn.length !== 8) return deny('Recovery code must be 8 English letters or digits', 400);
+    if (!tgTokIn || tgTokIn.indexOf(':') < 1) return deny('Telegram bot token is required', 400);
+    if (!/^-?\d{5,18}$/.test(tgChatIn)) return deny('Telegram admin chat id is required', 400);
+    if (email && !validEmail(email)) return deny('Invalid email', 400);
     try {
       await env.DB.exec(SCHEMA);
     } catch (e) {
@@ -1828,8 +1882,13 @@ async function handleApi(request, env, url) {
     await settingSet(env.DB, 'panel_name', 'Ham');
     await settingSet(env.DB, 'lang', lang);
     if (cfToken) await settingSet(env.DB, 'cf_token', cfToken);
-    if (tgTokIn) await settingSet(env.DB, 'tg_token', tgTokIn);
-    if (tgChatIn) await settingSet(env.DB, 'tg_chat', tgChatIn);
+    await settingSet(env.DB, 'tg_token', tgTokIn);
+    await settingSet(env.DB, 'tg_chat', tgChatIn);
+    var recSalt = crypto.getRandomValues(new Uint8Array(16));
+    var recHash = await hashPassword(recIn, recSalt);
+    await settingSet(env.DB, 'recovery_salt', b64(recSalt));
+    await settingSet(env.DB, 'recovery_hash', recHash);
+    if (email) await settingSet(env.DB, 'admin_email', email);
     await settingSet(env.DB, 'vpn_path', '/vpnws');
     await dbRun(env.DB, 'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', 'setup_complete', '1');
     await dbRun(env.DB, 'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', 'setup_at', nowIso());
@@ -1856,31 +1915,22 @@ async function handleApi(request, env, url) {
     if (locked) return deny('Too many attempts. Try again in 15 minutes.', 429);
     var lb = await readJson(request);
     if (!lb) return deny('Invalid JSON', 400);
-    var lu = String(lb.username || '').trim().toLowerCase();
     var lp = String(lb.password || '');
-    var user = await dbFirst(env.DB, 'SELECT * FROM users WHERE username = ?', lu);
-    var bad = false;
-    if (!user || !user.active) bad = true;
-    else {
-      var okHash = await hashPassword(lp, fromB64(user.salt));
-      if (!timingSafeEqualStr(okHash, user.password_hash)) bad = true;
+    var user = null;
+    var cand = await dbAll(env.DB, 'SELECT * FROM users WHERE active = 1 ORDER BY id ASC');
+    var ci, okHash;
+    for (ci = 0; ci < cand.length; ci++) {
+      okHash = await hashPassword(lp, fromB64(cand[ci].salt));
+      if (timingSafeEqualStr(okHash, cand[ci].password_hash)) { user = cand[ci]; break; }
     }
+    var bad = !user;
     if (bad) {
       if (!att) await dbRun(env.DB, 'INSERT INTO login_attempts (ip, count, window_start) VALUES (?, 1, ?)', ip, nowIso());
       else await dbRun(env.DB, 'UPDATE login_attempts SET count = count + 1 WHERE ip = ?', ip);
-      await audit(env.DB, user ? user.id : null, 'login_fail', lu, ip);
-      return deny('Invalid username or password', 401);
+      await audit(env.DB, null, 'login_fail', '', ip);
+      return deny('Invalid password', 401);
     }
     await dbRun(env.DB, 'DELETE FROM login_attempts WHERE ip = ?', ip);
-    var twofa = await settingGet(env.DB, 'tg_2fa');
-    var tgTok = await settingGet(env.DB, 'tg_token');
-    var tgChat = await settingGet(env.DB, 'tg_chat');
-    var adminN = 0;
-    try {
-      var acn = await dbFirst(env.DB, "SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND active = 1");
-      adminN = Number(acn && acn.c) || 0;
-    } catch (eAd) {}
-    var force2fa = twofa === '1' || adminN > 1;
     var loginCountry = (request.cf && request.cf.country) || '';
     var loginAsn = String((request.cf && request.cf.asn) || '');
     try {
@@ -1891,53 +1941,52 @@ async function handleApi(request, env, url) {
       }
       await settingSet(env.DB, 'login_meta', JSON.stringify({ country: loginCountry, asn: loginAsn, at: nowIso() }));
     } catch (eMeta) {}
-    if (force2fa && tgTok && tgChat) {
-      var code = String(Math.floor(100000 + Math.random() * 900000));
-      var ot = randomToken().slice(0, 24);
-      var exp2 = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-      try {
-        await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
-      } catch (eotp) {
-        await env.DB.exec('CREATE TABLE IF NOT EXISTS otp (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, code TEXT NOT NULL, expires_at TEXT NOT NULL);');
-        await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
-      }
-      var sent = await tgSend(env, null, '🔐 کد ورود Ham:\n' + code + '\nاعتبار: ۵ دقیقه');
-      if (!sent) {
-        var allow = parseAllowList(await settingGet(env.DB, 'allow_ips'));
-        if (allow.length && ipAllowed(ip, allow)) {
-          try { await tgSend(env, null, 'ورود اضطراری بدون ۲FA از IP مجاز: ' + ip); } catch (eEm) {}
-        } else {
-          return deny('کد به تلگرام نرفت. توکن بات و Chat ID را چک کنید.', 502);
-        }
-      } else {
-        return json({ ok: true, need_2fa: true, tmp: ot });
-      }
+    var code = genOtp8();
+    var ot = randomToken().slice(0, 24);
+    var exp2 = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    try {
+      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
+    } catch (eotp) {
+      await env.DB.exec('CREATE TABLE IF NOT EXISTS otp (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, code TEXT NOT NULL, expires_at TEXT NOT NULL);');
+      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
     }
-    await dbRun(env.DB, 'UPDATE users SET last_login = ? WHERE id = ?', nowIso(), user.id);
-    var hours = (lb && (lb.remember === true || lb.remember === 1 || lb.remember === '1')) ? (7 * 24) : 2;
-    var ls = await createSession(env.DB, user.id, request, hours);
-    await audit(env.DB, user.id, 'login', '', ip);
-    var inf = await notifyLogin(env, request, user);
-    return json({ ok: true, user: publicUser(user), login_ip: inf.ip, login_at: inf.at, csrf: ls.csrf }, 200, { 'Set-Cookie': sessionCookie(ls.token, request, false, hours * 3600) });
+    await sendLoginCodes(env, user, code);
+    var rememberOn = !!(lb && (lb.remember === true || lb.remember === 1 || lb.remember === '1'));
+    return json({ ok: true, need_2fa: true, tmp: ot, remember: rememberOn });
   }
 
   if (path === '/api/login/2fa' && method === 'POST') {
     var ob = await readJson(request) || {};
     var otok = String(ob.tmp || '');
-    var ocode = faDigitsToEn(ob.code || '');
+    var ocode = normOtp(ob.code || '');
+    var recOk = false;
+    try {
+      var rh = await settingGet(env.DB, 'recovery_hash');
+      var rs = await settingGet(env.DB, 'recovery_salt');
+      if (rh && rs && ocode.length === 8) {
+        var recH = await hashPassword(ocode, fromB64(rs));
+        if (timingSafeEqualStr(recH, rh)) recOk = true;
+      }
+    } catch (eR) {}
     var orow = await dbFirst(env.DB, 'SELECT * FROM otp WHERE token = ?', otok);
-    if (!orow || faDigitsToEn(orow.code) !== ocode) return deny('Invalid code', 401);
-    if (Date.parse(orow.expires_at) < Date.now()) {
-      await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok);
-      return deny('Code expired', 401);
+    if (!recOk) {
+      if (!orow || !timingSafeEqualStr(normOtp(orow.code), ocode) || ocode.length !== 8) return deny('Invalid code', 401);
     }
+    if (!recOk) {
+      if (Date.parse(orow.expires_at) < Date.now()) {
+        await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok);
+        return deny('Code expired', 401);
+      }
+    }
+    if (!orow) return deny('Invalid code', 401);
     await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok);
     await dbRun(env.DB, 'UPDATE users SET last_login = ? WHERE id = ?', nowIso(), orow.user_id);
     var user2 = await dbFirst(env.DB, 'SELECT * FROM users WHERE id = ?', orow.user_id);
-    var ls2 = await createSession(env.DB, orow.user_id, request);
+    var hours2 = (ob.remember === true || ob.remember === 1 || ob.remember === '1') ? (7 * 24) : 2;
+    var ls2 = await createSession(env.DB, orow.user_id, request, hours2);
     await audit(env.DB, orow.user_id, 'login_2fa', '', ip);
     var inf2 = await notifyLogin(env, request, user2);
-    return json({ ok: true, user: publicUser(user2), login_ip: inf2.ip, login_at: inf2.at, csrf: ls2.csrf }, 200, { 'Set-Cookie': sessionCookie(ls2.token, request, false, 2 * 3600) });
+    return json({ ok: true, user: publicUser(user2), login_ip: inf2.ip, login_at: inf2.at, csrf: ls2.csrf }, 200, { 'Set-Cookie': sessionCookie(ls2.token, request, false, hours2 * 3600) });
   }
 
   if (path === '/api/logout' && method === 'POST') {
@@ -1965,6 +2014,84 @@ async function handleApi(request, env, url) {
     if (me.role !== 'admin') return deny('Forbidden', 403);
     var ts = timingSafeEqualStr('ham', 'ham') && !timingSafeEqualStr('ham', 'hamx') && !timingSafeEqualStr('aa', 'bb');
     return json({ ok: ts, timing_safe: ts, csrf: !!(me.csrf), ip_source: 'CF-Connecting-IP', secrets: 'aes-gcm' });
+  }
+
+  if (path === '/api/recovery' && method === 'POST') {
+    var rb = await readJson(request) || {};
+    var rc = normOtp(rb.code);
+    if (rc.length !== 8) return deny('Recovery code must be 8 chars', 400);
+    var rSalt = crypto.getRandomValues(new Uint8Array(16));
+    var rHash = await hashPassword(rc, rSalt);
+    await settingSet(env.DB, 'recovery_salt', b64(rSalt));
+    await settingSet(env.DB, 'recovery_hash', rHash);
+    return json({ ok: true });
+  }
+
+  if (path === '/api/email' && method === 'POST') {
+    var eb = await readJson(request) || {};
+    var act = String(eb.action || 'start');
+    var ch = {};
+    try { ch = JSON.parse((await settingGet(env.DB, 'email_chg')) || '{}') || {}; } catch (eCh) { ch = {}; }
+    if (act === 'start') {
+      var oldE = String((me.email || '') || (await settingGet(env.DB, 'admin_email')) || '').trim();
+      var newE = String(eb.email || '').trim();
+      if (oldE) {
+        var c1 = genOtp8();
+        ch = { step: 'old', code: c1, uid: me.id, exp: Date.now() + 10 * 60 * 1000 };
+        await settingSet(env.DB, 'email_chg', JSON.stringify(ch));
+        await sendEmail(oldE, 'Ham email change', 'Ham code: ' + c1);
+        try { await tgSend(env, null, '🔐 کد تغییر ایمیل: ' + c1); } catch (eT1) {}
+        return json({ ok: true, step: 'old' });
+      }
+      if (!validEmail(newE)) return deny('Invalid email', 400);
+      var c2 = genOtp8();
+      ch = { step: 'new', code: c2, email: newE, uid: me.id, exp: Date.now() + 10 * 60 * 1000 };
+      await settingSet(env.DB, 'email_chg', JSON.stringify(ch));
+      await sendEmail(newE, 'Ham email confirm', 'Ham code: ' + c2);
+      try { await tgSend(env, null, '🔐 کد تأیید ایمیل: ' + c2); } catch (eT2) {}
+      return json({ ok: true, step: 'new' });
+    }
+    if (act === 'verify_old') {
+      if (!ch.step || ch.step !== 'old' || Date.now() > ch.exp) return deny('Expired', 400);
+      if (!timingSafeEqualStr(normOtp(eb.code), normOtp(ch.code))) return deny('Invalid code', 401);
+      var newE2 = String(eb.email || '').trim();
+      if (!validEmail(newE2)) return deny('Invalid email', 400);
+      var c3 = genOtp8();
+      ch = { step: 'new', code: c3, email: newE2, uid: me.id, exp: Date.now() + 10 * 60 * 1000 };
+      await settingSet(env.DB, 'email_chg', JSON.stringify(ch));
+      await sendEmail(newE2, 'Ham email confirm', 'Ham code: ' + c3);
+      try { await tgSend(env, null, '🔐 کد تأیید ایمیل جدید: ' + c3); } catch (eT3) {}
+      return json({ ok: true, step: 'new' });
+    }
+    if (act === 'verify_new') {
+      if (!ch.step || ch.step !== 'new' || Date.now() > ch.exp) return deny('Expired', 400);
+      if (!timingSafeEqualStr(normOtp(eb.code), normOtp(ch.code))) return deny('Invalid code', 401);
+      await settingSet(env.DB, 'admin_email', ch.email);
+      try { await dbRun(env.DB, 'UPDATE users SET email = ? WHERE id = ?', ch.email, me.id); } catch (eU) {}
+      await settingSet(env.DB, 'email_chg', '');
+      return json({ ok: true });
+    }
+    return deny('Bad action', 400);
+  }
+
+  if (path === '/api/ips/geo' && method === 'POST') {
+    var gb = await readJson(request) || {};
+    var list = gb.ips || [];
+    var geo = {};
+    var gi, gip, gr, gj;
+    for (gi = 0; gi < list.length && gi < 40; gi++) {
+      gip = String(list[gi] || '').trim();
+      if (!gip) continue;
+      try {
+        gr = await fetch('http://ip-api.com/json/' + encodeURIComponent(gip) + '?fields=status,country,countryCode', { method: 'GET' });
+        gj = await gr.json();
+        if (gj && gj.status === 'success') geo[gip] = { cc: gj.countryCode || '', country: gj.country || '' };
+        else geo[gip] = { cc: '', country: '?' };
+      } catch (eG) {
+        geo[gip] = { cc: '', country: '?' };
+      }
+    }
+    return json({ ok: true, geo: geo });
   }
 
   if (path === '/api/me' && method === 'GET') return json({ ok: true, user: publicUser(me), csrf: me.csrf || '' });
@@ -2192,6 +2319,7 @@ async function handleApi(request, env, url) {
         tg_token: await settingGet(env.DB, 'tg_token'),
         tg_chat: await settingGet(env.DB, 'tg_chat'),
         cf_token_set: (await settingGet(env.DB, 'cf_token')) ? '1' : '0',
+        admin_email_set: (await settingGet(env.DB, 'admin_email')) ? '1' : '0',
         allow_ips: await settingGet(env.DB, 'allow_ips'),
         abuse_gb: (await settingGet(env.DB, 'abuse_gb')) || '80',
         access_only: (await settingGet(env.DB, 'access_only')) === '1' ? '1' : '0',
@@ -3125,13 +3253,9 @@ async function handleTelegram(request, env, url) {
   } else return json({ ok: true });
   if (!chatId) return json({ ok: true });
   var allow = String(await settingGet(env.DB, 'tg_chat') || '').trim();
-  if (allow) {
-    var okc = allow.split(/[\s,]+/);
-    if (okc.indexOf(chatId) === -1) {
-      await tgApi(token, 'sendMessage', { chat_id: chatId, text: 'این چت مجاز نیست. Chat ID را در تنظیمات Ham بگذارید.' });
-      return json({ ok: true });
-    }
-  }
+  if (!allow) return json({ ok: true });
+  var okc = allow.split(/[\s,]+/).filter(Boolean);
+  if (okc.indexOf(chatId) === -1) return json({ ok: true });
   try {
     await ensureVpn(env.DB);
     var o = await proxySettings(env.DB, url.hostname);
@@ -3796,6 +3920,15 @@ pre.codeblock{font-family:ui-monospace,Menlo,monospace;font-size:12px;background
 .foot{display:none}
 #toast{position:fixed;inset-inline-end:12px;bottom:12px;display:flex;flex-direction:column;gap:8px;z-index:50}
 .toast{background:var(--text);color:var(--card);border:0;padding:10px 12px;border-radius:12px;font-size:13px}
+.otp-row{display:flex;gap:8px;justify-content:center;direction:ltr;margin:12px 0}
+.otp-cell{width:42px;height:42px;border-radius:50%;border:2px solid var(--line);background:var(--card);text-align:center;font-size:18px;font-weight:800;text-transform:uppercase}
+.otp-row.ok .otp-cell{border-color:#16a34a;background:#dcfce7;color:#14532d}
+.otp-row.bad .otp-cell{border-color:#dc2626;background:#fee2e2;color:#991b1b}
+.otp-banner{margin-top:14px;padding:16px;border-radius:16px;text-align:center;font-weight:700}
+.otp-banner.ok{background:#dcfce7;color:#14532d}
+.otp-banner.bad{background:#fee2e2;color:#991b1b}
+.otp-emo{font-size:42px;display:block;margin-bottom:6px}
+.rec-warn{color:#dc2626;font-weight:800;font-size:13px;line-height:1.7}
 html[data-theme="dark"] .toast{color:#0b0d12}
 .modalbg{position:fixed;inset:0;background:rgba(10,12,18,.5);display:grid;place-items:center;z-index:40;padding:12px}
 .modal{width:min(540px,100%);padding:18px;max-height:min(88vh,820px);overflow:auto}
@@ -3968,7 +4101,15 @@ done_user:'نام کاربری مدیر', done_cf:'کلید کلادفلر', don
 speed:'سقف سرعت (مگابیت، ۰ = آزاد)', extra_host:'دامنه اتصال', host_default:'دامنه ورکر (پیش‌فرض)',
 sub_pass:'رمز ساب (اختیاری)', one_shot:'لینک یک‌بارمصرف', clone:'کپی قالب', status_page:'صفحه وضعیت',
 clash:'کلش', singbox:'sing-box', extra_hosts:'دامنه‌های اضافه (هر خط یکی)', extra_hosts_h:'دامنه‌هایی که به همین ورکر وصل شده‌اند. در ساخت کانفیگ می‌توانید یکی را انتخاب کنید.',
-tg_2fa:'ورود دومرحله‌ای با تلگرام', tg_2fa_h:'بعد از رمز، کد ۶ رقمی به بات تلگرام می‌رود.', otp:'کد تلگرام', otp_h:'کد ۶ رقمی را از بات بخوانید.',
+tg_2fa:'ورود دومرحله‌ای با تلگرام', tg_2fa_h:'بعد از رمز، کد ۶ رقمی به بات تلگرام می‌رود.', otp:'کد ورود', otp_h:'کد ۸ کاراکتری انگلیسی (حرف و عدد) از تلگرام یا ایمیل، یا کد بازیابی.',
+otp_ok:'بله! با موفقیت وارد شدید', otp_bad:'کد اشتباه بود بیشتر دقت کن',
+rec_code:'کد بازیابی', rec_warn:'حتماً این کد را فراموش نکنید. اگر تلگرام یا ایمیل نباشد همین کد راه ورود است.',
+rec_bad:'کد بازیابی باید دقیقاً ۸ حرف یا عدد انگلیسی باشد',
+rec_need:'کد بازیابی را همین حالا بسازید و جایی امن نگه دارید.',
+email_need:'ایمیل ادمین را وارد کنید تا کد ورود به آن هم فرستاده شود.',
+email_new:'ایمیل جدید', email_old_code:'کد ایمیل قبلی',
+geo_wait:'کشور…',
+
 proxy_ips:'پروکسی خروجی', proxy_ips_h:'این آی‌پی‌ها داخل لینک کانفیگ نمی‌آیند. بعد از وصل شدن، ترافیک خروجی ورکر از این پروکسی‌ها رد می‌شود (برای سایت‌هایی مثل ChatGPT که مستقیم از ورکر باز نمی‌شوند). اگر خالی باشد خروجی مستقیم است.',
 backup_hosts:'ورکر پشتیبان (هر خط یک دامنه)', backup_hosts_h:'بعد از ذخیره همین‌جا برای ساخت کانفیگ دیده می‌شوند. بازدید از دامنهٔ پشتیبان آدرس داخل لینک را عوض نمی‌کند؛ همیشه دامنهٔ اصلی پنل استفاده می‌شود.',
 panel_host:'دامنهٔ اصلی کانفیگ', panel_host_h:'همین دامنه داخل لینک VLESS می‌آید. دامنهٔ پشتیبان را اینجا نگذارید.',
@@ -4091,7 +4232,15 @@ done_user:'Admin username', done_cf:'Cloudflare token', done_cf_yes:'Provided', 
 speed:'Speed cap (Mbps, 0 = free)', extra_host:'Connect host', host_default:'Worker host (default)',
 sub_pass:'Sub password (optional)', one_shot:'One-shot link', clone:'Clone', status_page:'Status page',
 clash:'Clash', singbox:'sing-box', extra_hosts:'Extra domains (one per line)', extra_hosts_h:'Domains pointed at this Worker. Pick one when building configs.',
-tg_2fa:'Telegram 2FA login', tg_2fa_h:'After password, a 6-digit code is sent to the bot.', otp:'Telegram code', otp_h:'Enter the 6-digit code from the bot.',
+tg_2fa:'Telegram 2FA login', tg_2fa_h:'After password, a 6-digit code is sent to the bot.', otp:'Login code', otp_h:'8 English letters/digits from Telegram or email, or your recovery code.',
+otp_ok:'Yes! You are signed in', otp_bad:'Wrong code — look again',
+rec_code:'Recovery code', rec_warn:'Never forget this code. It is the backup if Telegram or email fail.',
+rec_bad:'Recovery code must be exactly 8 English letters or digits',
+rec_need:'Set a recovery code now and store it somewhere safe.',
+email_need:'Enter an admin email so login codes can be sent there too.',
+email_new:'New email', email_old_code:'Code from old email',
+geo_wait:'country…',
+
 proxy_ips:'Outbound proxy', proxy_ips_h:'These IPs are NOT put in the config link. After you connect, the Worker sends traffic via these proxies (helps with sites like ChatGPT that block direct Worker IPs). Empty = direct.',
 backup_hosts:'Backup workers (one domain per line)', backup_hosts_h:'Shown after save for building configs. Visiting a backup domain never puts that host in links — the main panel host is always used.',
 panel_host:'Main config domain', panel_host_h:'This hostname is written into VLESS links. Do not put a backup domain here.',
@@ -4170,13 +4319,14 @@ function renderBoot(){
   document.getElementById('app').innerHTML = h('<div class="center"><div class="muted">', esc(t('boot')), '</div></div>');
 }
 
-var wiz = { step: 0, u:'', p:'', p2:'', e:'', tok:'', err:'' };
+var wiz = { step: 0, u:'admin', p:'', p2:'', e:'', rec:'', tok:'', err:'', tg_token:'', tg_chat:'' };
 
 function validUser(u){ return /^[a-z0-9_]{3,32}$/.test(String(u || '').trim().toLowerCase()); }
-function adminError(u, p, p2){
-  if (!validUser(u)) return t('user_bad');
+function adminError(p, p2, rec){
   if (String(p || '').length < 8) return t('pass_short');
   if (p !== p2) return t('mismatch');
+  rec = String(rec || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (rec.length !== 8) return t('rec_bad');
   return '';
 }
 function passLiveText(n){
@@ -4221,14 +4371,14 @@ function renderSetup(){
       '<p class="why">', esc(t('admin_help')), '</p>',
       wiz.err ? h('<div class="err">', esc(wiz.err), '</div>') : '',
       '<form data-form="wiz-admin">',
-      '<div class="field"><label>', esc(t('user')), '</label><input class="input" name="u" value="', esc(wiz.u), '" autocomplete="username" required minlength="3" maxlength="32">',
-      '<div class="hint">', esc(t('user_hint')), '</div></div>',
       '<div class="split">',
       '<div class="field"><label>', esc(t('pass')), '</label><input class="input" name="p" type="password" autocomplete="new-password" required minlength="8" value="', esc(wiz.p), '">',
       '<div id="pass-live" class="', live.c, '">', esc(live.m), '</div></div>',
       '<div class="field"><label>', esc(t('pass2')), '</label><input class="input" name="p2" type="password" autocomplete="new-password" required minlength="8" value="', esc(wiz.p2), '"></div>',
       '</div>',
-      '<div class="field"><label>', esc(t('email')), '</label><input class="input" name="e" value="', esc(wiz.e), '" type="email"></div>',
+      '<div class="field"><label>', esc(t('email')), '</label><input class="input" name="e" value="', esc(wiz.e), '" type="email" placeholder="admin@email.com"></div>',
+      '<div class="field"><label>', esc(t('rec_code')), '</label><input class="input" name="rec" maxlength="8" dir="ltr" style="text-transform:uppercase;letter-spacing:4px" value="', esc(wiz.rec), '" required>',
+      '<div class="rec-warn">', esc(t('rec_warn')), '</div></div>',
       '<div class="row" style="justify-content:space-between">',
       '<button class="btn" type="button" data-act="wiz-back">', esc(t('back')), '</button>',
       '<button class="btn primary" type="submit">', esc(t('next')), '</button></div></form>'
@@ -4238,7 +4388,6 @@ function renderSetup(){
       '<h2 style="margin-bottom:8px">', esc(t('done_t')), '</h2>',
       '<p class="muted" style="margin:0 0 14px">', esc(t('done_s')), '</p>',
       '<div class="okbox">', esc(t('vpn_help')), '</div>',
-      '<div class="help"><div>', esc(t('done_user')), ': <code>', esc(wiz.u), '</code></div></div>',
       '<p class="hint" style="margin-top:14px">', esc(t('wiz_tg_h')), '</p>',
       '<div class="field"><label>', esc(t('tg_token')), '</label><input class="input" id="wiz-tg-token" value="', esc(wiz.tg_token || ''), '" placeholder="123456:ABC..."></div>',
       '<div class="field"><label>', esc(t('tg_chat')), '</label><input class="input" id="wiz-tg-chat" value="', esc(wiz.tg_chat || ''), '" placeholder="123456789" inputmode="numeric"></div>',
@@ -4262,16 +4411,64 @@ function renderSetup(){
   );
 }
 
-function renderLogin2fa(tmp){
+function otpBoxesHtml(){
+  var i, s = '<div class="otp-row" id="otp-row">';
+  for (i = 0; i < 8; i++) s += '<input class="otp-cell" maxlength="1" inputmode="text" autocomplete="off" data-i="' + i + '">';
+  return s + '</div><div id="otp-banner"></div>';
+}
+function bindOtp(onFull){
+  var cells = document.querySelectorAll('.otp-cell');
+  function val(){
+    var s = '', i;
+    for (i = 0; i < cells.length; i++) s += String(cells[i].value || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    return s.slice(0, 8);
+  }
+  function paint(ch, idx){
+    ch = String(ch || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!ch) { cells[idx].value = ''; return; }
+    cells[idx].value = ch.charAt(0);
+    if (idx < 7) cells[idx + 1].focus();
+    if (val().length === 8 && onFull) onFull(val());
+  }
+  Array.prototype.forEach.call(cells, function(el, idx){
+    el.addEventListener('input', function(){ paint(el.value, idx); });
+    el.addEventListener('keydown', function(ev){
+      if (ev.key === 'Backspace' && !el.value && idx > 0) { cells[idx-1].focus(); cells[idx-1].value=''; }
+    });
+    el.addEventListener('paste', function(ev){
+      ev.preventDefault();
+      var p = normOtp((ev.clipboardData || window.clipboardData).getData('text'));
+      var i;
+      for (i = 0; i < 8; i++) cells[i].value = p.charAt(i) || '';
+      if (p.length === 8 && onFull) onFull(p);
+    });
+  });
+  if (cells[0]) cells[0].focus();
+  return val;
+}
+function showOtpBanner(ok){
+  var row = document.getElementById('otp-row');
+  var ban = document.getElementById('otp-banner');
+  if (row) row.className = 'otp-row ' + (ok ? 'ok' : 'bad');
+  if (ban) ban.innerHTML = ok
+    ? h('<div class="otp-banner ok"><span class="otp-emo">😄</span>', esc(t('otp_ok')), '</div>')
+    : h('<div class="otp-banner bad"><span class="otp-emo">😢</span>', esc(t('otp_bad')), '</div>');
+}
+function renderLogin2fa(tmp, remember){
   document.getElementById('app').innerHTML = h(
-    '<div class="center"><div class="card" style="width:min(420px,100%);padding:26px">',
+    '<div class="center"><div class="card" style="width:min(460px,100%);padding:26px">',
     '<div class="brand" style="margin-bottom:18px">', logo(), '<div><h1 style="font-size:22px">', esc(t('otp')), '</h1><div class="muted" style="font-size:12px">', esc(t('otp_h')), '</div></div></div>',
     '<form data-form="login-2fa">',
     '<input type="hidden" name="tmp" value="', esc(tmp || ''), '">',
-    '<div class="field"><label>', esc(t('otp')), '</label><input class="input" name="code" inputmode="numeric" autocomplete="one-time-code" required></div>',
-    '<button class="btn primary" style="width:100%" type="submit">', esc(t('enter')), '</button>',
+    otpBoxesHtml(),
     '</form></div></div>'
   );
+  bindOtp(function(code){
+    api('/api/login/2fa','POST',{ tmp: tmp, code: code, remember: !!remember }).then(function(r){
+      showOtpBanner(!!r.ok);
+      if (r.ok) setTimeout(function(){ boot(); }, 900);
+    });
+  });
 }
 function renderLogin(){
   document.getElementById('app').innerHTML = h(
@@ -4280,7 +4477,6 @@ function renderLogin(){
     '<div class="brand">', logo(), '<div><h1 style="font-size:22px">', esc(brandName()), '</h1><div class="muted" style="font-size:12px">', esc(t('login_sub')), '</div></div></div>',
     langBtn(), '</div>',
     '<form data-form="login">',
-    '<div class="field"><label>', esc(t('user')), '</label><input class="input" name="u" autocomplete="username" required></div>',
     '<div class="field"><label>', esc(t('pass')), '</label><input class="input" name="p" type="password" autocomplete="current-password" required></div>',
     '<label class="pill" style="margin-bottom:12px"><input type="checkbox" name="remember"> ', esc(t('remember')), '</label>',
     '<button class="btn primary" style="width:100%" type="submit">', esc(t('enter')), '</button>',
@@ -4361,13 +4557,29 @@ function syncIpPick(){
   for (i = 0; i < ips.length; i++){
     ip = ips[i];
     ping = S.ipPing ? S.ipPing[ip] : null;
+    var geo = (S.ipGeo && S.ipGeo[ip]) ? (S.ipGeo[ip].cc || S.ipGeo[ip].country) : '';
     html += '<label class="pill"><input type="checkbox" name="proxy_ip_on" value="' + esc(ip) + '"' + (on[ip] ? ' checked' : '') + '> ' + esc(ip);
+    if (geo) html += ' · ' + esc(geo);
     if (ping === 'wait' || ping === '…') html += ' · …';
     else if (ping === -1) html += ' · N/A';
     else if (typeof ping === 'number' && ping >= 0) html += ' · ' + ping + 'ms';
     html += '</label>';
   }
   box.innerHTML = html + '</div>';
+  requestIpGeo(ips);
+}
+function requestIpGeo(ips){
+  S.ipGeo = S.ipGeo || {};
+  var miss = [];
+  var i;
+  for (i = 0; i < ips.length; i++) if (!S.ipGeo[ips[i]]) miss.push(ips[i]);
+  if (!miss.length) return;
+  api('/api/ips/geo','POST',{ ips: miss.slice(0, 40) }).then(function(r){
+    if (!r.ok || !r.geo) return;
+    var k;
+    for (k in r.geo) if (r.geo[k]) S.ipGeo[k] = r.geo[k];
+    syncIpPick();
+  });
 }
 function randName(){
   var c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -4488,8 +4700,7 @@ function vpnModal(pr){
     '<div class="modalbg"><div class="card modal"><h3 style="margin-bottom:12px">', esc(pr ? t('edit_vpn') : t('vpn_new')), '</h3>',
     '<form data-form="', pr ? 'vpn-edit' : 'vpn-add', '">',
     pr ? h('<input type="hidden" name="id" value="', esc(pr.id), '">') : '',
-    '<div class="split"><div class="field"><label>', esc(t('vpn_name')), '</label><input class="input" name="name" value="', esc(pr ? pr.name : randName()), '" required></div>',
-    '<div class="field"><label>', esc(t('vpn_loc')), '</label>', locSelect('location'), '</div></div>',
+    '<div class="field"><label>', esc(t('vpn_name')), '</label><input class="input" name="name" value="', esc(pr ? pr.name : randName()), '" required></div>',
     '<div class="field"><label>', esc(t('remark')), '</label><input class="input" name="remark" value="', esc(pr ? (pr.remark||'') : ''), '" placeholder="', esc(t('remark_h')), '"></div>',
     '<div class="field"><label>UUID</label><div class="row"><input class="input grow" name="uuid" id="uuid-in" value="', esc(pr ? (pr.uuid||'') : ''), '" placeholder="', esc(t('vpn_uuid_ph')), '"><button class="btn" type="button" data-act="uuid-gen">', esc(t('vpn_uuid_rand')), '</button></div></div>',
     '<div class="field"><label>', esc(t('vpn_proto')), ' · ', esc(t('vpn_one_proto')), '</label><div class="chkgrid">',
@@ -4519,8 +4730,10 @@ function vpnModal(pr){
         extra = '';
         if (ping === -1) extra = ' · N/A';
         else if (typeof ping === 'number') extra = ' · ' + ping + 'ms';
-        html += '<label class="pill"><input type="radio" name="cfg_ip" value="' + esc(ip) + '"' + (sel===ip?' checked':'') + '> ' + esc(ip) + '<span data-ip-ms="' + esc(ip) + '">' + extra + '</span></label>';
+        var g = (S.ipGeo && S.ipGeo[ip]) ? (S.ipGeo[ip].cc || S.ipGeo[ip].country) : '';
+        html += '<label class="pill"><input type="radio" name="cfg_ip" value="' + esc(ip) + '"' + (sel===ip?' checked':'') + '> ' + esc(ip) + (g ? ' · ' + esc(g) : '') + '<span data-ip-ms="' + esc(ip) + '">' + extra + '</span></label>';
       }
+      try { requestIpGeo(pool); } catch (eG2) {}
       return html + '</div></div>';
     })(),
     '<div class="row" style="justify-content:flex-end"><button class="btn" type="button" data-act="modal-close">', esc(t('cancel')), '</button>',
@@ -4551,7 +4764,6 @@ function subModal(s){
     '<div class="field"><label>', esc(t('vpn_days')), '</label><input class="input" name="days" type="number" min="0" value="', esc(days), '"></div>',
     '</div>',
     '<div class="split">',
-    '<div class="field"><label>', esc(t('vpn_loc')), '</label>', locSelect('location'), '</div>',
     '<div class="field"><label>', esc(t('vpn_maxip')), '</label><input class="input" name="max_ip" type="number" min="0" value="', esc(s ? String(s.max_ip||0) : '0'), '"></div>',
     '</div>',
     '<div class="field"><label>', esc(t('vpn_proto')), '</label><div class="chkgrid">',
@@ -4941,7 +5153,8 @@ function viewSettings(){
       '<p class="hint">', esc(t('tg_bot')), '</p>',
       '<div class="field"><label>', esc(t('tg_token')), '</label><input class="input" name="tg_token" value="', esc(s.tg_token || ''), '"></div>',
       '<div class="field"><label>', esc(t('tg_chat')), '</label><input class="input" name="tg_chat" value="', esc(s.tg_chat || ''), '"></div>',
-      '<label class="pill" style="margin-bottom:12px"><input type="checkbox" name="tg_2fa"', s.tg_2fa==='1'?' checked':'', '> ', esc(t('tg_2fa')), '</label><div class="hint">', esc(t('tg_2fa_h')), '</div>',
+      '<div class="field"><label>', esc(t('email')), '</label><input class="input" name="admin_email" type="email" value="" placeholder="', esc(s.has_email || s.admin_email_set ? '••••' : ''), '"><div class="hint">', esc(t('email_need')), '</div></div>',
+      '<div class="row" style="margin-bottom:12px"><button class="btn" type="button" data-act="email-chg">', esc(t('email')), '</button></div>',
       '<div class="row" style="margin-bottom:12px"><button class="btn" type="button" data-act="tg-test">', esc(t('tg_test')), '</button></div>',
       '<h3 style="margin:8px 0 12px">', esc(t('backup')), '</h3>',
       '<div class="row" style="margin-bottom:12px">',
@@ -5015,8 +5228,35 @@ function paint(){
   if (!S.status){ document.body.className=''; renderBoot(); return; }
   if (!S.status.db || !S.status.setup){ document.body.className='stage-wiz'; renderSetup(); return; }
   if (!S.status.authed){ document.body.className='stage-login'; renderLogin(); return; }
+  if (S.status.need_recovery){ document.body.className='stage-login'; renderRecoveryGate(); return; }
+  if (S.status.need_email){ document.body.className='stage-login'; renderEmailGate(); return; }
   document.body.className='stage-app';
   renderApp();
+}
+function renderRecoveryGate(){
+  document.getElementById('app').innerHTML = h(
+    '<div class="center"><div class="card" style="width:min(460px,100%);padding:26px">',
+    '<h2>', esc(t('rec_code')), '</h2>',
+    '<p class="rec-warn">', esc(t('rec_warn')), '</p>',
+    '<p class="muted">', esc(t('rec_need')), '</p>',
+    '<form data-form="set-recovery">',
+    '<div class="field"><input class="input" name="rec" maxlength="8" dir="ltr" style="text-transform:uppercase;letter-spacing:4px" required></div>',
+    '<button class="btn primary" type="submit" style="width:100%">', esc(t('save')), '</button>',
+    '</form></div></div>'
+  );
+}
+function renderEmailGate(){
+  document.getElementById('app').innerHTML = h(
+    '<div class="center"><div class="card" style="width:min(460px,100%);padding:26px">',
+    '<h2>', esc(t('email')), '</h2>',
+    '<p class="muted">', esc(t('email_need')), '</p>',
+    '<form data-form="set-email">',
+    '<div class="field"><input class="input" name="email" type="email" required></div>',
+    '<button class="btn primary" type="submit" style="width:100%">', esc(t('next')), '</button>',
+    '</form>',
+    '<div id="email-otp"></div>',
+    '</div></div>'
+  );
 }
 
 async function boot(){
@@ -5044,16 +5284,38 @@ document.getElementById('app').addEventListener('click', function(e){
   if (act === 'wiz-skip'){ wiz.tok=''; wiz.step=3; renderSetup(); return; }
   if (act === 'wiz-recheck'){ boot(); return; }
   if (act === 'wiz-finish'){
-    var fe = adminError(wiz.u, wiz.p, wiz.p2);
+    var fe = adminError(wiz.p, wiz.p2, wiz.rec);
     if (fe){ wiz.err = fe; wiz.step = 1; renderSetup(); toast(fe, true); return; }
     var tgTokEl = document.getElementById('wiz-tg-token');
     var tgChatEl = document.getElementById('wiz-tg-chat');
     wiz.tg_token = tgTokEl ? String(tgTokEl.value || '').trim() : '';
     wiz.tg_chat = tgChatEl ? String(tgChatEl.value || '').trim() : '';
-    api('/api/setup','POST',{ username:wiz.u, password:wiz.p, email:wiz.e, cf_token:wiz.tok, lang:S.lang, tg_token:wiz.tg_token, tg_chat:wiz.tg_chat }).then(function(r){
+    if (!wiz.tg_token || wiz.tg_token.indexOf(':') < 1){ toast(t('tg_token'), true); return; }
+    if (!/^-?\d{5,18}$/.test(wiz.tg_chat)){ toast(t('tg_chat'), true); return; }
+    api('/api/setup','POST',{ password:wiz.p, email:wiz.e, recovery:wiz.rec, lang:S.lang, tg_token:wiz.tg_token, tg_chat:wiz.tg_chat }).then(function(r){
       if (!r.ok){ toast(r.error || t('err'), true); return; }
       if (r.login_ip) toast(t('login_info') + ' ' + r.login_ip);
       boot();
+    });
+    return;
+  }
+  if (act === 'email-chg'){
+    var em = (document.querySelector('[name=admin_email]') || {}).value || '';
+    api('/api/email','POST',{ action:'start', email: em }).then(function(r){
+      if (!r.ok){ toast(r.error||t('err'), true); return; }
+      var code = prompt(t('otp'));
+      if (!code) return;
+      if (r.step === 'old') {
+        var neu = prompt(t('email_new'));
+        api('/api/email','POST',{ action:'verify_old', code: code, email: neu }).then(function(r2){
+          if (!r2.ok){ toast(r2.error||t('err'), true); return; }
+          var c2 = prompt(t('otp'));
+          if (!c2) return;
+          api('/api/email','POST',{ action:'verify_new', code: c2 }).then(function(r3){ toast(r3.ok?t('saved'):(r3.error||t('err')), !r3.ok); });
+        });
+      } else {
+        api('/api/email','POST',{ action:'verify_new', code: code }).then(function(r3){ toast(r3.ok?t('saved'):(r3.error||t('err')), !r3.ok); });
+      }
     });
     return;
   }
@@ -5316,34 +5578,68 @@ document.getElementById('app').addEventListener('submit', function(e){
   var fd = new FormData(f);
   var form = f.getAttribute('data-form');
   if (form === 'wiz-admin'){
-    wiz.u = String(fd.get('u')||'').trim().toLowerCase();
+    wiz.u = 'admin';
     wiz.p = String(fd.get('p')||'');
     wiz.p2 = String(fd.get('p2')||'');
     wiz.e = String(fd.get('e')||'');
-    wiz.err = adminError(wiz.u, wiz.p, wiz.p2);
+    wiz.rec = String(fd.get('rec')||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    wiz.err = adminError(wiz.p, wiz.p2, wiz.rec);
     if (wiz.err){ renderSetup(); toast(wiz.err, true); return; }
     wiz.step = 2; renderSetup(); return;
   }
   if (form === 'wiz-cf'){ wiz.step = 2; renderSetup(); return; }
   if (form === 'login'){
-    api('/api/login','POST',{ username: fd.get('u'), password: fd.get('p'), remember: !!(f.querySelector('[name=remember]') && f.querySelector('[name=remember]').checked) }).then(function(r){
+    api('/api/login','POST',{ password: fd.get('p'), remember: !!(f.querySelector('[name=remember]') && f.querySelector('[name=remember]').checked) }).then(function(r){
       if (!r.ok) toast(r.error || t('err'), true);
-      else if (r.need_2fa) renderLogin2fa(r.tmp);
-      else {
-        if (r.login_ip) toast(t('login_info') + ' ' + r.login_ip + ' · ' + (r.login_at || ''));
-        boot();
-      }
+      else if (r.need_2fa) renderLogin2fa(r.tmp, r.remember);
+      else boot();
     });
     return;
   }
   if (form === 'login-2fa'){
-    api('/api/login/2fa','POST',{ tmp: fd.get('tmp'), code: fd.get('code') }).then(function(r){
-      if (!r.ok) toast(r.error || t('err'), true);
-      else {
-        if (r.login_ip) toast(t('login_info') + ' ' + r.login_ip + ' · ' + (r.login_at || ''));
-        boot();
+    return;
+  }
+  if (form === 'set-recovery'){
+    var rc = String(fd.get('rec')||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    if (rc.length !== 8){ toast(t('rec_bad'), true); return; }
+    api('/api/recovery','POST',{ code: rc }).then(function(r){
+      if (!r.ok) toast(r.error||t('err'), true); else boot();
+    });
+    return;
+  }
+  if (form === 'set-email'){
+    api('/api/email','POST',{ action:'start', email: fd.get('email') }).then(function(r){
+      if (!r.ok){ toast(r.error||t('err'), true); return; }
+      var box = document.getElementById('email-otp');
+      if (box){
+        box.innerHTML = otpBoxesHtml();
+        bindOtp(function(code){
+          api('/api/email','POST',{ action:'verify_new', code: code }).then(function(r2){
+            showOtpBanner(!!r2.ok);
+            if (r2.ok) setTimeout(function(){ boot(); }, 800);
+          });
+        });
       }
     });
+    return;
+  }
+  if (form === 'email-change'){
+    var st = f.getAttribute('data-step') || 'start';
+    if (st === 'start'){
+      api('/api/email','POST',{ action:'start', email: fd.get('email') }).then(function(r){
+        if (!r.ok){ toast(r.error||t('err'), true); return; }
+        toast(t('otp'));
+        f.setAttribute('data-step', r.step === 'old' ? 'old' : 'new');
+      });
+    } else if (st === 'old'){
+      api('/api/email','POST',{ action:'verify_old', code: fd.get('code'), email: fd.get('email') }).then(function(r){
+        if (!r.ok) toast(r.error||t('err'), true); else { toast(t('otp')); f.setAttribute('data-step','new'); }
+      });
+    } else {
+      api('/api/email','POST',{ action:'verify_new', code: fd.get('code') }).then(function(r){
+        if (!r.ok) toast(r.error||t('err'), true); else { toast(t('saved')); boot(); }
+      });
+    }
     return;
   }
   if (form === 'user-add'){
@@ -5436,6 +5732,7 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (fd.get('tg_token') != null) payload.tg_token = fd.get('tg_token');
     if (fd.get('tg_chat') != null) payload.tg_chat = fd.get('tg_chat');
     if (fd.get('cf_token') != null && String(fd.get('cf_token') || '').trim()) payload.cf_token = fd.get('cf_token');
+    if (fd.get('admin_email') != null && String(fd.get('admin_email') || '').trim()) payload.admin_email_new = fd.get('admin_email');
     if (f.querySelector('[name=tg_2fa]')) payload.tg_2fa = f.querySelector('[name=tg_2fa]').checked ? '1' : '0';
     if (f.querySelector('[name=proxy_ips]')) {
       payload.proxy_ips = fd.get('proxy_ips') || '';
