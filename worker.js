@@ -1,6 +1,6 @@
 /**
  * Ham — panel for create VPN free
- * Author: Hamb4
+ * Author: dev-penhan
  */
 
 import { connect } from 'cloudflare:sockets';
@@ -117,7 +117,9 @@ function fmtTehran(d) {
 }
 
 function clientIp(request) {
-  return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '0.0.0.0';
+  var ip = (request.headers.get('CF-Connecting-IP') || '').trim();
+  if (!ip) ip = (request.headers.get('CF-Connecting-IPv6') || '').trim();
+  return ip || '0.0.0.0';
 }
 
 function hasDB(env) {
@@ -176,6 +178,22 @@ function hex(bytes) {
 
 function randomToken() {
   return hex(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+function timingSafeEqualStr(a, b) {
+  a = String(a || '');
+  b = String(b || '');
+  var ea = new TextEncoder().encode(a);
+  var eb = new TextEncoder().encode(b);
+  var n = Math.max(ea.length, eb.length, 32);
+  var da = new Uint8Array(n);
+  var db = new Uint8Array(n);
+  da.set(ea);
+  db.set(eb);
+  var d = ea.length ^ eb.length;
+  var i;
+  for (i = 0; i < n; i++) d |= da[i] ^ db[i];
+  return d === 0;
 }
 
 async function hashPassword(password, saltBytes) {
@@ -237,17 +255,172 @@ async function isSetup(db) {
   }
 }
 
+var SECRET_SETTING = { tg_token: 1, cf_token: 1 };
+
+async function installKey(db) {
+  var k = '';
+  try {
+    var row = await dbFirst(db, 'SELECT value FROM settings WHERE key = ?', 'install_key');
+    k = row && row.value ? String(row.value) : '';
+  } catch (e0) {}
+  if (!k) {
+    k = hex(crypto.getRandomValues(new Uint8Array(32)));
+    try {
+      await dbRun(db, 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', 'install_key', k);
+    } catch (e1) {}
+  }
+  return k;
+}
+
+async function wrapCryptoKey(db) {
+  var inst = await installKey(db);
+  var raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('HamWrap.v1|' + inst));
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function secretSeal(db, plain) {
+  plain = String(plain == null ? '' : plain);
+  if (!plain) return '';
+  if (plain.indexOf('enc:v1:') === 0) return plain;
+  try {
+    var key = await wrapCryptoKey(db);
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(plain));
+    var mixed = new Uint8Array(12 + ct.byteLength);
+    mixed.set(iv, 0);
+    mixed.set(new Uint8Array(ct), 12);
+    return 'enc:v1:' + b64(mixed);
+  } catch (e) {
+    return plain;
+  }
+}
+
+async function secretOpen(db, val) {
+  val = String(val || '');
+  if (val.indexOf('enc:v1:') !== 0) return val;
+  try {
+    var bin = fromB64(val.slice(7));
+    if (!bin || bin.length < 13) return '';
+    var iv = bin.slice(0, 12);
+    var ct = bin.slice(12);
+    var key = await wrapCryptoKey(db);
+    var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ct);
+    return new TextDecoder().decode(pt);
+  } catch (e) {
+    return '';
+  }
+}
+
 async function settingGet(db, key) {
   try {
     var row = await dbFirst(db, 'SELECT value FROM settings WHERE key = ?', key);
-    return row && row.value != null ? row.value : '';
+    var val = row && row.value != null ? row.value : '';
+    if (SECRET_SETTING[key] && val) val = await secretOpen(db, val);
+    return val;
   } catch (e) {
     return '';
   }
 }
 
 async function settingSet(db, key, value) {
+  if (SECRET_SETTING[key]) value = await secretSeal(db, value);
   await dbRun(db, 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, value);
+}
+
+function pickNum() {
+  var i, v;
+  for (i = 0; i < arguments.length; i++) {
+    v = arguments[i];
+    if (v == null || v === '') continue;
+    v = Number(v);
+    if (!isNaN(v)) return v;
+  }
+  return null;
+}
+
+function fmtToman(n) {
+  n = Math.round(Number(n) || 0);
+  if (n < 0) n = 0;
+  var s = String(n);
+  var out = '';
+  var i;
+  for (i = 0; i < s.length; i++) {
+    if (i && (s.length - i) % 3 === 0) out += ',';
+    out += s.charAt(i);
+  }
+  return out + ' تومان';
+}
+
+async function usdTomanRate() {
+  return 100000;
+}
+
+async function cfJson(token, path) {
+  var ctrl = new AbortController();
+  var tid = setTimeout(function () { try { ctrl.abort(); } catch (eA) {} }, 4000);
+  try {
+    var r = await fetch('https://api.cloudflare.com/client/v4' + path, {
+      headers: { Authorization: 'Bearer ' + token },
+      signal: ctrl.signal
+    });
+    clearTimeout(tid);
+    return await r.json();
+  } catch (e) {
+    try { clearTimeout(tid); } catch (e2) {}
+    return null;
+  }
+}
+
+async function cfAccountMoney(db) {
+  var out = { ok: false, used_h: '', left_h: '—', err: 'no_token' };
+  var token = '';
+  try { token = String(await settingGet(db, 'cf_token') || '').trim(); } catch (e0) {}
+  if (!token || token === '-') return out;
+  var acc = await cfJson(token, '/accounts?per_page=5');
+  if (!acc || !acc.success || !acc.result || !acc.result.length) {
+    out.err = 'token';
+    return out;
+  }
+  var id = acc.result[0].id;
+  var usedUsd = 0;
+  var usage = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billable-usage');
+  if (usage && usage.success && usage.result) {
+    var rows = Array.isArray(usage.result) ? usage.result : [];
+    var i, row, key, cum, map = {};
+    for (i = 0; i < rows.length; i++) {
+      row = rows[i] || {};
+      key = String(row.ServiceName || row.service_name || ('r' + i));
+      cum = pickNum(row.CumulatedContractedCost, row.cumulated_contracted_cost, row.ContractedCost, row.contracted_cost);
+      if (cum == null) continue;
+      if (map[key] == null || cum > map[key]) map[key] = cum;
+    }
+    for (key in map) if (Object.prototype.hasOwnProperty.call(map, key)) usedUsd += map[key];
+  }
+  var leftUsd = null;
+  var cr = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billing/credits');
+  if (cr && cr.success && cr.result != null) {
+    var res = cr.result;
+    if (typeof res === 'number') leftUsd = res;
+    else if (Array.isArray(res)) {
+      var s = 0;
+      for (i = 0; i < res.length; i++) s += Number(pickNum(res[i].remaining, res[i].amount, res[i].balance, res[i].credit) || 0);
+      leftUsd = s;
+    } else {
+      leftUsd = pickNum(res.remaining, res.balance, res.amount, res.available, res.credit);
+    }
+  }
+  if (leftUsd == null) {
+    var pr = await cfJson(token, '/accounts/' + encodeURIComponent(id) + '/billing/profile');
+    if (pr && pr.success && pr.result) leftUsd = pickNum(pr.result.balance, pr.result.credit, pr.result.account_balance);
+  }
+  var rate = await usdTomanRate();
+  out.ok = true;
+  out.err = '';
+  out.used_usd = usedUsd;
+  out.left_usd = leftUsd;
+  out.used_h = fmtToman(usedUsd * rate);
+  out.left_h = leftUsd == null ? '—' : fmtToman(leftUsd * rate);
+  return out;
 }
 
 async function audit(db, userId, action, detail, ip) {
@@ -261,9 +434,10 @@ async function authUser(env, request) {
   var token = getCookie(request, 'ham_sid');
   if (!token) return null;
   try {
+    await ensureSessionCols(env.DB);
     var row = await dbFirst(
       env.DB,
-      'SELECT s.token, s.expires_at, u.id, u.username, u.role, u.email, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
+      'SELECT s.token, s.expires_at, s.csrf, u.id, u.username, u.role, u.email, u.active FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?',
       token
     );
     if (!row) return null;
@@ -272,6 +446,10 @@ async function authUser(env, request) {
       return null;
     }
     if (!row.active) return null;
+    if (!row.csrf) {
+      row.csrf = randomToken();
+      try { await dbRun(env.DB, 'UPDATE sessions SET csrf = ? WHERE token = ?', row.csrf, token); } catch (eCsrf) {}
+    }
     try {
       var left = Date.parse(row.expires_at) - Date.now();
       var slideH = left > 36 * 3600 * 1000 ? 7 * 24 : 2;
@@ -288,12 +466,21 @@ function publicUser(u) {
   return { id: u.id, username: u.username, role: u.role, email: u.email || '' };
 }
 
+var SESSION_COLS_OK = false;
+async function ensureSessionCols(db) {
+  if (SESSION_COLS_OK) return;
+  try { await db.exec("ALTER TABLE sessions ADD COLUMN csrf TEXT DEFAULT ''"); } catch (e) {}
+  SESSION_COLS_OK = true;
+}
+
 async function createSession(db, userId, request, hours) {
   hours = Number(hours) > 0 ? Number(hours) : 2;
+  await ensureSessionCols(db);
   var token = randomToken();
+  var csrf = randomToken();
   var exp = new Date(Date.now() + hours * 3600 * 1000).toISOString();
-  await dbRun(db, 'INSERT INTO sessions (token, user_id, created_at, expires_at, ip, ua) VALUES (?, ?, ?, ?, ?, ?)', token, userId, nowIso(), exp, clientIp(request), (request.headers.get('User-Agent') || '').slice(0, 180));
-  return token;
+  await dbRun(db, 'INSERT INTO sessions (token, user_id, created_at, expires_at, ip, ua, csrf) VALUES (?, ?, ?, ?, ?, ?, ?)', token, userId, nowIso(), exp, clientIp(request), (request.headers.get('User-Agent') || '').slice(0, 180), csrf);
+  return { token: token, csrf: csrf };
 }
 
 function pathIds(path, re) {
@@ -1081,6 +1268,7 @@ function parseVless(buf) {
 
 function dataToU8(data) {
   if (!data) return Promise.resolve(null);
+  if (typeof data === 'string') return Promise.resolve(null);
   if (data instanceof Uint8Array) return Promise.resolve(data);
   if (data instanceof ArrayBuffer) return Promise.resolve(new Uint8Array(data));
   if (ArrayBuffer.isView(data)) return Promise.resolve(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
@@ -1097,18 +1285,29 @@ function makeWsQueue(ws) {
   function die() {
     closed = true;
     if (pend) { var fn = pend; pend = null; fn(null); }
+    try { ws.close(); } catch (eC) {}
   }
   ws.addEventListener('message', function (ev) {
+    if (closed) return;
     if (pend) { var fn = pend; pend = null; fn(ev.data); }
     else q.push(ev.data);
   });
   ws.addEventListener('close', die);
   ws.addEventListener('error', die);
   return {
-    next: function () {
+    next: function (ms) {
       if (q.length) return Promise.resolve(q.shift());
       if (closed) return Promise.resolve(null);
-      return new Promise(function (res) { pend = res; });
+      return new Promise(function (res) {
+        pend = res;
+        if (ms > 0) {
+          setTimeout(function () {
+            if (pend !== res) return;
+            pend = null;
+            res(null);
+          }, ms);
+        }
+      });
     }
   };
 }
@@ -1297,6 +1496,7 @@ async function proxyDns(ws, info, pump) {
 }
 
 async function lookupPeer(env, buf) {
+  if (!env || !env.DB) return null;
   await ensureVpn(env.DB);
   var uid = bytesToUuid(buf, 1).toLowerCase();
   var peer = await dbFirst(env.DB, 'SELECT * FROM vpn_peers WHERE uuid = ? COLLATE NOCASE', uid);
@@ -1348,7 +1548,7 @@ async function runTunnel(ws, env, ctx, ip, pump, early) {
   try {
     await Promise.resolve();
     var raw = early;
-    if (!raw) raw = await pump.next();
+    if (!raw) raw = await pump.next(12000);
     var buf = await dataToU8(raw);
     if (!buf || buf.length < 18) { try { ws.close(); } catch (e0) {} return; }
     var found = await lookupPeer(env, buf);
@@ -1410,14 +1610,20 @@ async function handleVpnUpgrade(request, env, ctx, url) {
   var server = pair[1];
   server.accept();
   try { server.binaryType = 'arraybuffer'; } catch (e4) {}
+  function shutWs() { try { server.close(); } catch (eS) {} }
+  server.addEventListener('close', shutWs);
+  server.addEventListener('error', shutWs);
   var pump = makeWsQueue(server);
   var proto = request.headers.get('Sec-WebSocket-Protocol') || '';
   var early = parseEarly(proto);
   var headers = { Upgrade: 'websocket' };
   if (proto) headers['Sec-WebSocket-Protocol'] = proto.split(',')[0].trim();
-  var task = runTunnel(server, env, ctx, clientIp(request), pump, early);
-  if (ctx && ctx.waitUntil) ctx.waitUntil(task);
-  else task.catch(function () {});
+  var task = runTunnel(server, env, ctx, clientIp(request), pump, early).then(function () {
+    shutWs();
+  }).catch(function () {
+    shutWs();
+  });
+  try { if (ctx && ctx.waitUntil) ctx.waitUntil(task); } catch (eW) {}
   return new Response(null, { status: 101, webSocket: client, headers: headers });
 }
 
@@ -1434,7 +1640,7 @@ async function handleApi(request, env, url) {
       headers: {
         'access-control-allow-origin': new URL(request.url).origin,
         'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-        'access-control-allow-headers': 'content-type',
+        'access-control-allow-headers': 'content-type, x-csrf-token',
         'access-control-allow-credentials': 'true',
         'access-control-max-age': '86400'
       }
@@ -1443,7 +1649,7 @@ async function handleApi(request, env, url) {
   if (method !== 'GET' && method !== 'HEAD' && !originOk(request)) return deny('Bad origin', 403);
 
   if (path === '/api/status' && method === 'GET') {
-    var out = { ok: true, db: hasDB(env), setup: false, authed: false, user: null, panel: 'Ham', author: 'Hamb4' };
+    var out = { ok: true, db: hasDB(env), setup: false, authed: false, user: null, panel: 'Ham', author: 'dev-penhan' };
     if (!out.db) return json(out);
     out.setup = await isSetup(env.DB);
     var me = await authUser(env, request);
@@ -1456,6 +1662,7 @@ async function handleApi(request, env, url) {
       if (pn) out.panel = pn;
     }
     if (out.authed) {
+      out.csrf = me.csrf || '';
       try { await rememberPanelHost(env.DB, request); } catch (ePh) {}
     }
     return json(out);
@@ -1505,7 +1712,7 @@ async function handleApi(request, env, url) {
     await audit(env.DB, created.id, 'setup', 'initial wizard', ip);
     var setupUser = { username: username };
     var infs = await notifyLogin(env, request, setupUser);
-    return json({ ok: true, login_ip: infs.ip, login_at: infs.at }, 200, { 'Set-Cookie': sessionCookie(sid, request, false) });
+    return json({ ok: true, login_ip: infs.ip, login_at: infs.at, csrf: sid.csrf }, 200, { 'Set-Cookie': sessionCookie(sid.token, request, false) });
   }
 
   if (!hasDB(env)) return deny('D1 binding DB is missing', 428);
@@ -1531,7 +1738,7 @@ async function handleApi(request, env, url) {
     if (!user || !user.active) bad = true;
     else {
       var okHash = await hashPassword(lp, fromB64(user.salt));
-      if (okHash !== user.password_hash) bad = true;
+      if (!timingSafeEqualStr(okHash, user.password_hash)) bad = true;
     }
     if (bad) {
       if (!att) await dbRun(env.DB, 'INSERT INTO login_attempts (ip, count, window_start) VALUES (?, 1, ?)', ip, nowIso());
@@ -1562,7 +1769,7 @@ async function handleApi(request, env, url) {
     var ls = await createSession(env.DB, user.id, request, hours);
     await audit(env.DB, user.id, 'login', '', ip);
     var inf = await notifyLogin(env, request, user);
-    return json({ ok: true, user: publicUser(user), login_ip: inf.ip, login_at: inf.at }, 200, { 'Set-Cookie': sessionCookie(ls, request, false, hours * 3600) });
+    return json({ ok: true, user: publicUser(user), login_ip: inf.ip, login_at: inf.at, csrf: ls.csrf }, 200, { 'Set-Cookie': sessionCookie(ls.token, request, false, hours * 3600) });
   }
 
   if (path === '/api/login/2fa' && method === 'POST') {
@@ -1581,26 +1788,44 @@ async function handleApi(request, env, url) {
     var ls2 = await createSession(env.DB, orow.user_id, request);
     await audit(env.DB, orow.user_id, 'login_2fa', '', ip);
     var inf2 = await notifyLogin(env, request, user2);
-    return json({ ok: true, user: publicUser(user2), login_ip: inf2.ip, login_at: inf2.at }, 200, { 'Set-Cookie': sessionCookie(ls2, request, false, 2 * 3600) });
+    return json({ ok: true, user: publicUser(user2), login_ip: inf2.ip, login_at: inf2.at, csrf: ls2.csrf }, 200, { 'Set-Cookie': sessionCookie(ls2.token, request, false, 2 * 3600) });
   }
 
   if (path === '/api/logout' && method === 'POST') {
     var tok = getCookie(request, 'ham_sid');
-    if (tok) await dbRun(env.DB, 'DELETE FROM sessions WHERE token = ?', tok);
+    if (tok) {
+      try {
+        await ensureSessionCols(env.DB);
+        var srow = await dbFirst(env.DB, 'SELECT csrf FROM sessions WHERE token = ?', tok);
+        var ch = request.headers.get('x-csrf-token') || '';
+        if (srow && srow.csrf && !timingSafeEqualStr(ch, srow.csrf)) return deny('CSRF', 403);
+      } catch (eLo) {}
+      await dbRun(env.DB, 'DELETE FROM sessions WHERE token = ?', tok);
+    }
     return json({ ok: true }, 200, { 'Set-Cookie': sessionCookie('', request, true) });
   }
 
   var me = await authUser(env, request);
   if (!me) return deny('Unauthorized', 401);
+  if (method !== 'GET' && method !== 'HEAD') {
+    var csrfHdr = request.headers.get('x-csrf-token') || '';
+    if (!timingSafeEqualStr(csrfHdr, me.csrf || '')) return deny('CSRF', 403);
+  }
 
-  if (path === '/api/me' && method === 'GET') return json({ ok: true, user: publicUser(me) });
+  if (path === '/api/selfcheck' && method === 'GET') {
+    if (me.role !== 'admin') return deny('Forbidden', 403);
+    var ts = timingSafeEqualStr('ham', 'ham') && !timingSafeEqualStr('ham', 'hamx') && !timingSafeEqualStr('aa', 'bb');
+    return json({ ok: ts, timing_safe: ts, csrf: !!(me.csrf), ip_source: 'CF-Connecting-IP', secrets: 'aes-gcm' });
+  }
+
+  if (path === '/api/me' && method === 'GET') return json({ ok: true, user: publicUser(me), csrf: me.csrf || '' });
 
   if (path === '/api/me/password' && method === 'POST') {
     var pb = await readJson(request);
     if (!pb) return deny('Invalid JSON', 400);
     var full = await dbFirst(env.DB, 'SELECT * FROM users WHERE id = ?', me.id);
     var cur = await hashPassword(String(pb.current || ''), fromB64(full.salt));
-    if (cur !== full.password_hash) return deny('Current password is wrong', 400);
+    if (!timingSafeEqualStr(cur, full.password_hash)) return deny('Current password is wrong', 400);
     var np = String(pb.next || '');
     if (np.length < 8) return deny('Password must be at least 8 characters', 400);
     var ns = crypto.getRandomValues(new Uint8Array(16));
@@ -1632,6 +1857,8 @@ async function handleApi(request, env, url) {
       city: (request.cf && request.cf.city) || '',
       asOrg: (request.cf && request.cf.asOrganization) || ''
     };
+    var cfMoney = { ok: false, used_h: '', left_h: '—' };
+    try { cfMoney = await cfAccountMoney(env.DB); } catch (eCf) {}
     return json({
       ok: true,
       users: (uc && uc.c) || 0,
@@ -1644,6 +1871,7 @@ async function handleApi(request, env, url) {
       used_h: fmtBytes(usedSum),
       subs: (scount && scount.c) || 0,
       loc: loc,
+      cf_money: cfMoney,
       daily: daily,
       cfgs: (await dbAll(env.DB, 'SELECT id, name, used_bytes, quota_bytes, expire_at, enabled, location FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 ORDER BY id DESC LIMIT 40')).map(function (row) {
         var q = Number(row.quota_bytes) || 0;
@@ -1784,6 +2012,7 @@ async function handleApi(request, env, url) {
         cf_ports: cfSaved.join(','),
         tg_token: await settingGet(env.DB, 'tg_token'),
         tg_chat: await settingGet(env.DB, 'tg_chat'),
+        cf_token_set: (await settingGet(env.DB, 'cf_token')) ? '1' : '0',
         theme: (await settingGet(env.DB, 'theme')) === 'dark' ? 'dark' : 'light',
         extra_hosts: await settingGet(env.DB, 'extra_hosts'),
         proxy_ips: await settingGet(env.DB, 'proxy_ips'),
@@ -1840,6 +2069,11 @@ async function handleApi(request, env, url) {
     }
     if (typeof sb.tg_token === 'string') await settingSet(env.DB, 'tg_token', sb.tg_token.trim());
     if (typeof sb.tg_chat === 'string') await settingSet(env.DB, 'tg_chat', sb.tg_chat.trim());
+    if (typeof sb.cf_token === 'string') {
+      var cft = sb.cf_token.trim();
+      if (cft === '-') await settingSet(env.DB, 'cf_token', '');
+      else if (cft) await settingSet(env.DB, 'cf_token', cft);
+    }
     var tokNow = await settingGet(env.DB, 'tg_token');
     if (tokNow) {
       try {
@@ -3408,7 +3642,7 @@ html[data-theme="dark"] .toast{color:#0b0d12}
 var S = { lang: localStorage.getItem('ham_lang') || 'fa', status: null, view: '/', busy: false };
 var T = {
 fa: {
-brand:'Ham', tag:'پنل فیلترشکن', author:'Hamb4',
+brand:'Ham', tag:'پنل فیلترشکن', author:'dev-penhan',
 boot:'در حال بارگذاری…',
 w_title:'راه‌اندازی پنل Ham', w_sub:'اگر اولین‌بار است نگران نباشید. دیتابیس را وصل کنید، حساب مدیر بسازید، بعد فیلترشکن می‌سازید.',
 s_db:'دیتابیس', s_admin:'حساب مدیر', s_cf:'کلادفلر', s_go:'آماده',
@@ -3435,12 +3669,15 @@ pass_hint:'حداقل ۸ کاراکتر. این رمز را بعداً برای 
 pass_short:'رمز عبور کوتاه است. حداقل ۸ کاراکتر وارد کنید.',
 pass_need:'برای ادامه هنوز این تعداد کاراکتر کم است: ',
 pass_ok:'طول رمز مناسب است.',
-cf_tok:'کلید API کلادفلر (اختیاری)',
-cf_hint:'این کلید به پنل اجازه می‌دهد زون‌ها، DNS و کش را از حساب کلادفلرتان بخواند و تغییر دهد. مثل کلید خانه است؛ به کسی ندهید.',
+cf_tok:'توکن API کلادفلر',
+cf_hint:'توکن با دسترسی Billing Read. مصرف و ماندهٔ حساب را در داشبورد نشان می‌دهد.',
+cf_spend:'مصرف', cf_left:'مانده', cf_no_tok:'توکن کلادفلر را در تنظیمات بگذارید',
+cf_tok_saved:'توکن ذخیره است. برای عوض کردن، توکن جدید بنویسید.',
+
 cf_how:'اگر الان کلید ندارید «فعلاً رد کن» را بزنید. بعداً از صفحه تنظیمات داخل پنل هم می‌توانید بگذارید.',
 cf_steps:'ساخت کلید: در کلادفلر روی آیکون آدمک بالا راست → My Profile → API Tokens → Create Token. قالب Edit zone DNS را بردارید و دسترسی Cache Purge را هم اضافه کنید. کلید فقط یک‌بار نشان داده می‌شود؛ کپی کنید و در کادر پایین بچسبانید.',
 login:'ورود', login_sub:'وارد پنل شوید', enter:'ورود به پنل',
-logout:'خروج', dash:'نمای کلی', users:'کاربران', cf:'کلادفلر', dns:'DNS', cache:'کش', logs:'گزارش‌ها', settings:'تنظیمات',
+logout:'خروج', dash:'داشبورد', users:'کاربران', cf:'کلادفلر', dns:'DNS', cache:'کش', logs:'گزارش‌ها', settings:'تنظیمات',
 hello:'سلام', users_n:'کاربران', sess:'نشست‌ها', today:'رویداد امروز', zones:'زون‌ها',
 cf_on:'متصل به کلادفلر', cf_off:'توکن کلادفلر تنظیم نشده',
 recent:'آخرین رویدادها', add_user:'کاربر جدید', role:'نقش', active:'فعال', actions:'عملیات',
@@ -3472,8 +3709,8 @@ vpn_proto:'پروتکل‌ها', vpn_quota:'حجم (گیگ، ۰ = نامحدود
 vpn_maxip:'سقف کاربر/آی‌پی (۰ = آزاد)', vpn_traffic:'ترافیک', vpn_edge:'لبه کلادفلر', vpn_proxy:'تنظیمات پروکسی',
 vpn_proto_hint:'تونل زنده روی ورکر: VLESS.',
 loc_random:'رندوم', logs_clear:'حذف گزارش‌ها',
-set_sec:'امنیت و استتار', set_panel_path:'مسیر پنل', set_panel_path_h:'پنل فقط روی همین مسیر باز می‌شود. پیش‌فرض /dash',
-set_camo:'آدرس استتار', set_camo_h:'اگر کسی دامنه را بدون مسیر پنل باز کند به این آدرس می‌رود.',
+set_sec:'امنیت و استتار', set_panel_path:'مسیر پنل', set_panel_path_h:'فقط آدرس ورود را عوض می‌کند، جای رمز عبور نیست. پیش‌فرض /dash',
+set_camo:'آدرس استتار', set_camo_h:'بدون مسیر پنل به اینجا می‌رود. استتار امنیت نیست؛ ورود با رمز لازم است.',
 set_kill:'خروج از همه دستگاه‌ها', set_reset_tr:'صفر کردن ترافیک همه کانفیگ‌ها',
 ips:'آی‌پی اتصال', ips_h:'هر خط یک IP. در ویرایش فیلترشکن/ساب تیک بزن تا همان یک کانفیگ از روی آن IP وصل شود — برای هر IP کانفیگ جدا ساخته نمی‌شود.', ips_none:'اول در تنظیمات IP وارد کن.', ips_pick:'آی‌پی‌ها', tg_bot:'ربات منو دارد: ساخت، دریافت لینک، ارسال برای کسی. توکن را ذخیره کنید تا وب‌هوک ست شود.',
 ports:'پورت‌های کلادفلر', ports_h:'پیش‌فرض: ۸۰، ۸۰۸۰، ۴۴۳ و ۲۰۵۲. بقیه را در پورت اضافه بنویسید.',
@@ -3523,7 +3760,7 @@ login_info:'ورود با IP',
 
 },
 en: {
-brand:'Ham', tag:'Cloudflare panel and tunnel', author:'Hamb4',
+brand:'Ham', tag:'Cloudflare panel and tunnel', author:'dev-penhan',
 boot:'Loading…',
 w_title:'Set up Ham', w_sub:'Three short steps: connect the database, create your admin login, then optionally add a Cloudflare API token.',
 s_db:'Database', s_admin:'Admin account', s_cf:'Cloudflare', s_go:'Ready',
@@ -3550,12 +3787,15 @@ pass_hint:'At least 8 characters. You will need this password to sign in.',
 pass_short:'Password is too short. Use at least 8 characters.',
 pass_need:'Still this many characters short: ',
 pass_ok:'Password length looks good.',
-cf_tok:'Cloudflare API token (optional)',
-cf_hint:'This token lets the panel read and change your zones, DNS and cache. Treat it like a house key.',
+cf_tok:'Cloudflare API token',
+cf_hint:'Needs Billing Read. Used on the dashboard for spend and remaining credit.',
+cf_spend:'Used', cf_left:'Left', cf_no_tok:'Add a Cloudflare token in Settings',
+cf_tok_saved:'Token is saved. Paste a new one to replace it.',
+
 cf_how:'If you do not have a token now, press Skip for now. You can add it later under Settings.',
 cf_steps:'To create one: Cloudflare profile icon (top right) → My Profile → API Tokens → Create Token. Start from Edit zone DNS and also add Cache Purge. The token is shown once — copy it into the box below.',
 login:'Sign in', login_sub:'Sign in', enter:'Enter panel',
-logout:'Sign out', dash:'Overview', users:'Users', cf:'Cloudflare', dns:'DNS', cache:'Cache', logs:'Logs', settings:'Settings',
+logout:'Sign out', dash:'Dashboard', users:'Users', cf:'Cloudflare', dns:'DNS', cache:'Cache', logs:'Logs', settings:'Settings',
 hello:'Hello', users_n:'Users', sess:'Sessions', today:'Events today', zones:'Zones',
 cf_on:'Connected to Cloudflare', cf_off:'Cloudflare token not set',
 recent:'Recent events', add_user:'New user', role:'Role', active:'Active', actions:'Actions',
@@ -3587,8 +3827,8 @@ vpn_proto:'Protocols', vpn_quota:'Quota GB (0 = unlimited)', vpn_days:'Days (0 =
 vpn_maxip:'Max IP/devices (0 = free)', vpn_traffic:'Traffic', vpn_edge:'Cloudflare edge', vpn_proxy:'Proxy settings',
 vpn_proto_hint:'Live tunnel on the Worker: VLESS.',
 loc_random:'Random', logs_clear:'Clear logs',
-set_sec:'Security and camouflage', set_panel_path:'Panel path', set_panel_path_h:'The panel opens only on this path. Default /dash',
-set_camo:'Camouflage URL', set_camo_h:'Visiting the domain without the panel path redirects here.',
+set_sec:'Security and camouflage', set_panel_path:'Panel path', set_panel_path_h:'Hides the URL only — not a password. Default /dash',
+set_camo:'Camouflage URL', set_camo_h:'Root redirects here. Obscurity is not auth; login is still required.',
 set_kill:'Sign out all sessions', set_reset_tr:'Reset traffic on all configs',
 ips:'Connect IPs', ips_h:'One IP per line. Tick in VPN/sub edit so that single config connects via the IP — not one config per IP.', ips_none:'Add IPs in Settings first.', ips_pick:'IPs', tg_bot:'The bot has a menu: create, get links, share. Save the token to set the webhook.',
 ports:'Cloudflare ports', ports_h:'Defaults: 80, 8080, 443, 2052. Add others in Extra ports.',
@@ -3662,9 +3902,14 @@ function toast(msg, bad){
 var BASE = location.pathname; while (BASE.length > 1 && BASE.charAt(BASE.length-1)==='/') BASE = BASE.slice(0,-1); if (!BASE) BASE = '/dash';
 function api(path, method, body){
   var opt = { method: method || 'GET', credentials: 'same-origin', headers: {} };
+  if (S.csrf) opt.headers['X-CSRF-Token'] = S.csrf;
   if (body !== undefined){ opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   return fetch(BASE + path, opt).then(function(res){
-    return res.json().then(function(j){ j._status = res.status; return j; }).catch(function(){ return { ok:false, error:'Bad response', _status: res.status }; });
+    return res.json().then(function(j){
+      j._status = res.status;
+      if (j && j.csrf) S.csrf = j.csrf;
+      return j;
+    }).catch(function(){ return { ok:false, error:'Bad response', _status: res.status }; });
   });
 }
 function route(){
@@ -4217,6 +4462,11 @@ function viewDash(){
       '<div class="card stat"><div class="muted">', esc(t('vpn')), '</div><b>', esc(d.peers_on || 0), '</b><div class="muted" style="font-size:11px">', esc(d.peers || 0), '</div></div>',
       '<div class="card stat"><div class="muted">', esc(t('vpn_traffic')), '</div><b>', esc(d.used_h || '0 B'), '</b></div>',
             '<div class="card stat"><div class="muted">', esc(t('vpn_loc')), '</div><b>', esc((d.loc && (d.loc.country || d.loc.colo)) || '—'), '</b><div class="muted" style="font-size:11px">', esc((d.loc && (d.loc.city || d.loc.colo)) || ''), '</div></div>',
+      '<div class="card stat"><div class="muted">', esc(t('cf')), '</div>',
+      (d.cf_money && d.cf_money.ok
+        ? h('<b>', esc(t('cf_spend')), ' ', esc(d.cf_money.used_h), '</b><div class="muted" style="font-size:11px">', esc(t('cf_left')), ' ', esc(d.cf_money.left_h), '</div>')
+        : h('<b style="font-size:13px">', esc(t('cf_no_tok')), '</b>')),
+      '</div>',
       '</div>',
       '<div class="card" style="margin-top:14px;padding:16px">',
       '<span class="pill ok">', esc(t('vpn_edge')), '</span> <span class="muted">', esc((d.loc && d.loc.asOrg) || 'Cloudflare'), ' · ', esc((d.loc && d.loc.colo) || ''), '</span>',
@@ -4437,6 +4687,8 @@ function viewSettings(){
             '<h3 style="margin:8px 0 12px">', esc(t('set_sec')), '</h3>',
       '<div class="field"><label>', esc(t('set_panel_path')), '</label><input class="input" name="panel_path" value="', esc(s.panel_path || '/dash'), '"><div class="hint">', esc(t('set_panel_path_h')), '</div></div>',
       '<div class="field"><label>', esc(t('set_camo')), '</label><input class="input" name="camouflage_url" value="', esc(s.camouflage_url || 'https://ubuntu.com/'), '"><div class="hint">', esc(t('set_camo_h')), '</div></div>',
+      '<h3 style="margin:8px 0 12px">', esc(t('cf')), '</h3>',
+      '<div class="field"><label>', esc(t('cf_tok')), '</label><input class="input" name="cf_token" placeholder="Bearer token" value="" autocomplete="off"><div class="hint">', esc(s.cf_token_set === '1' ? t('cf_tok_saved') : t('cf_hint')), '</div></div>',
       '<h3 style="margin:8px 0 12px">', esc(t('tg')), '</h3>',
       '<p class="hint">', esc(t('tg_h')), '</p>',
       '<p class="hint">', esc(t('tg_bot')), '</p>',
@@ -4526,6 +4778,7 @@ async function boot(){
   renderBoot();
   try { S.status = await api('/api/status'); }
   catch(e){ S.status = { ok:false, db:false, setup:false, authed:false }; }
+  if (S.status && S.status.csrf) S.csrf = S.status.csrf;
   paint();
 }
 
@@ -4933,6 +5186,7 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (f.querySelector('[name=cf_port]')) payload.cf_ports = pickedPorts(f, 'cf_port').join(',');
     if (fd.get('tg_token') != null) payload.tg_token = fd.get('tg_token');
     if (fd.get('tg_chat') != null) payload.tg_chat = fd.get('tg_chat');
+    if (fd.get('cf_token') != null && String(fd.get('cf_token') || '').trim()) payload.cf_token = fd.get('cf_token');
     if (f.querySelector('[name=tg_2fa]')) payload.tg_2fa = f.querySelector('[name=tg_2fa]').checked ? '1' : '0';
     if (f.querySelector('[name=proxy_ips]')) {
       payload.proxy_ips = fd.get('proxy_ips') || '';
