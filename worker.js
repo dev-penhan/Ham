@@ -774,7 +774,9 @@ function subInfoRemark(sub, peers) {
   var d = remainDays(sub.expire_at);
   var ds = d < 0 ? '∞' : String(d) + 'd';
   var nm = sub.brand || sub.name || 'Ham';
-  return nm + ' | ' + ds + ' | ' + vol;
+  var usedH = fmtBytes(used);
+  var leftH = q > 0 ? fmtBytes(left) : '∞';
+  return nm + ' | مصرف ' + usedH + ' | مانده ' + leftH + ' | زمان ' + ds;
 }
 
 function infoVless(remark) {
@@ -893,8 +895,12 @@ async function migrateDefaultPorts(db) {
   try { await disableBadPortPeers(db); } catch (e2) {}
 }
 
-function extraQuery(pr) {
-  return '';
+function extraQuery(pr, o) {
+  o = o || {};
+  var q = '';
+  if ((pr && Number(pr.fragment)) || o.fragment) q += '&fragment=' + encodeURIComponent('tlshello,100-200,10-20');
+  if (o.ech) q += '&ech=1';
+  return q;
 }
 
 function displayName(pr) {
@@ -1040,6 +1046,7 @@ function subAsPeer(su) {
     mux: su.mux,
     speed_kbps: su.speed_kbps,
     extra_host: su.extra_host,
+    ips: su.ips || '',
     _kind: 'sub'
   };
 }
@@ -1135,7 +1142,13 @@ async function proxySettings(db, host) {
   var backups = [];
   try { backups = parseHostLines(await settingGet(db, 'backup_hosts')); } catch (eB) { backups = []; }
   var main = await canonicalHost(db, host);
-  return { host: main, path: path, sni: main, wsHost: main, fp: 'chrome', ips: ips, backups: backups };
+  var fp = 'chrome';
+  var ech = false, fragment = false, rtt0 = false;
+  try { fp = String(await settingGet(db, 'bypass_fp') || 'chrome').trim() || 'chrome'; } catch (eF) {}
+  try { ech = (await settingGet(db, 'bypass_ech')) === '1'; } catch (eE) {}
+  try { fragment = (await settingGet(db, 'bypass_fragment')) === '1'; } catch (eFr) {}
+  try { rtt0 = (await settingGet(db, 'bypass_0rtt')) === '1'; } catch (eR) {}
+  return { host: main, path: path, sni: main, wsHost: main, fp: fp, ips: ips, backups: backups, ech: ech, fragment: fragment, rtt0: rtt0 };
 }
 
 function parseIpLines(s) {
@@ -1220,14 +1233,23 @@ function addrList(row, o) {
   return out.length ? out : [o.host];
 }
 
-function vlessLink(uuid, o, name, port, extra, addr) {
+function vlessLink(uuid, o, name, port, extra, addr, viaIp) {
   port = Number(port) || 443;
   var tls = isTlsPort(port);
   var domain = tlsName(o);
   var server = wrapAddr(addr || domain);
+  if (isIpAddr(server) || isBadProxyIp(String(addr || ''))) server = wrapAddr(domain);
+  var path = o.path || '/vpnws';
+  if (viaIp && !isBadProxyIp(viaIp)) {
+    path = path + '/' + String(viaIp).replace(/[^0-9A-Za-z.:]/g, '');
+  }
   var q = 'encryption=none&security=' + (tls ? 'tls' : 'none');
-  if (tls) q += '&sni=' + encodeURIComponent(domain) + '&fp=' + encodeURIComponent(o.fp || 'chrome') + '&alpn=' + encodeURIComponent('http/1.1');
-  q += '&type=ws&host=' + encodeURIComponent(domain) + '&path=' + encodeURIComponent(o.path || '/vpnws');
+  if (tls) {
+    q += '&sni=' + encodeURIComponent(domain) + '&fp=' + encodeURIComponent((o && o.fp) || 'chrome');
+    if (o && o.rtt0) q += '&alpn=' + encodeURIComponent('h3,h2,http/1.1');
+    else q += '&alpn=' + encodeURIComponent('http/1.1');
+  }
+  q += '&type=ws&host=' + encodeURIComponent(domain) + '&path=' + encodeURIComponent(path);
   if (extra) q += extra;
   return 'vless://' + uuid + '@' + server + ':' + port + '?' + q + '#' + encodeURIComponent(name || 'Ham');
 }
@@ -1246,11 +1268,11 @@ function trojanLink(pass, o, name, port, extra, addr) {
 
 function peerLinks(pr, o) {
   if (pr && pr.extra_host && !isIpAddr(pr.extra_host)) {
-    o = { host: pr.extra_host, path: o.path, sni: pr.extra_host, wsHost: pr.extra_host, fp: o.fp || 'chrome', ips: o.ips };
+    o = { host: pr.extra_host, path: o.path, sni: pr.extra_host, wsHost: pr.extra_host, fp: o.fp || 'chrome', ips: o.ips, ech: o.ech, fragment: o.fragment, rtt0: o.rtt0 };
   }
   var brand = pr.brand || pr.name || 'Ham';
   var port = Number(pr.port) || 443;
-  var extra = extraQuery(pr);
+  var extra = extraQuery(pr, o);
   var protos = cleanProtos(pr.protocols);
   var pass = pr.trojan_pass || pr.uuid;
   var addrs = addrList(pr, o);
@@ -1278,36 +1300,25 @@ function peerLinks(pr, o) {
 
 function subLinkList(su, o) {
   if (su && su.extra_host && !isIpAddr(su.extra_host)) {
-    o = { host: su.extra_host, path: o.path, sni: su.extra_host, wsHost: su.extra_host, fp: o.fp || 'chrome', ips: o.ips };
+    o = { host: su.extra_host, path: o.path, sni: su.extra_host, wsHost: su.extra_host, fp: o.fp || 'chrome', ips: o.ips, ech: o.ech, fragment: o.fragment, rtt0: o.rtt0 };
   }
   var brand = su.brand || su.name || 'Ham';
-  var ports = cleanPorts(su.ports || '443', false);
-  var protos = cleanProtos(su.protocols);
-  var extra = extraQuery(su);
-  var pass = su.trojan_pass || su.uuid;
+  var port = cleanPorts(su.ports || '443', true)[0] || 443;
+  var extra = extraQuery(su, o);
   var addrs = addrList(su, o);
+  var server = addrs[0] || (o && o.host);
+  var vias = parseIpLines(su.ips);
+  if (!vias.length) vias = [''];
   var lines = [];
   var clash = [];
-  var i, j, a, port, proto, remark, link;
-  for (a = 0; a < addrs.length; a++) {
-    for (i = 0; i < ports.length; i++) {
-      port = ports[i];
-      for (j = 0; j < protos.length; j++) {
-        proto = protos[j];
-        remark = cfgRemark(port, brand, proto);
-        if (addrs.length > 1) remark = addrs[a] + ' ' + remark;
-        if (su.location) remark = su.location + ' ' + remark;
-        if (proto === 'vless') {
-          link = vlessLink(su.uuid, o, remark, port, extra, addrs[a]);
-          lines.push(link);
-          clash.push({ name: remark, type: 'vless', uuid: su.uuid, port: port, tls: isTlsPort(port), server: addrs[a] });
-        } else if (proto === 'trojan') {
-          link = trojanLink(pass, o, remark, port, extra, addrs[a]);
-          lines.push(link);
-          clash.push({ name: remark, type: 'trojan', password: pass, port: port, tls: isTlsPort(port), server: addrs[a] });
-        }
-      }
-    }
+  var i, via, remark, link;
+  for (i = 0; i < vias.length; i++) {
+    via = vias[i];
+    remark = brand;
+    if (via) remark = brand + ' · ' + via;
+    link = vlessLink(su.uuid, o, remark, port, extra, server, via);
+    lines.push(link);
+    clash.push({ name: remark, type: 'vless', uuid: su.uuid, port: port, tls: isTlsPort(port), server: server });
   }
   return { lines: lines, clash: clash, count: lines.length };
 }
@@ -1699,7 +1710,7 @@ async function lookupPeer(env, buf) {
   return null;
 }
 
-async function runTunnel(ws, env, ctx, ip, pump, early) {
+async function runTunnel(ws, env, ctx, ip, pump, early, viaIp) {
   var meter = { n: 0, id: 0, kind: 'peer' };
   try {
     await Promise.resolve();
@@ -1721,6 +1732,7 @@ async function runTunnel(ws, env, ctx, ip, pump, early) {
     meter.kind = peer._kind === 'sub' ? 'sub' : 'peer';
     meter.speed = Number(peer.speed_kbps) || 0;
     meter.proxies = parseIpLines(peer.ips);
+    if (viaIp && (!meter.proxies.length || meter.proxies.indexOf(viaIp) !== -1)) meter.proxies = [viaIp];
     if (kind === 'vless') wsSend(ws, new Uint8Array([info.ver || 0, 0]));
     var cmd = info.cmd;
     if (cmd === 1 || cmd === 0x01) await proxyTcp(ws, info, meter, pump);
@@ -1765,14 +1777,26 @@ async function runTunnel(ws, env, ctx, ip, pump, early) {
 async function handleVpnUpgrade(request, env, ctx, url) {
   var path = VPN_PATH_MEM || '/vpnws';
   var pn = url.pathname;
-  if (pn !== path && pn !== path + '/' && pn !== '/vpnws' && pn !== '/vpnws/') {
+  var viaIp = '';
+  function matchVpnPath(base) {
+    if (pn === base || pn === base + '/') return true;
+    if (base && pn.indexOf(base + '/') === 0) {
+      var rest = pn.slice(base.length + 1).split('/')[0];
+      try { rest = decodeURIComponent(rest); } catch (eD) {}
+      rest = String(rest || '').replace(/[^0-9A-Za-z.:]/g, '');
+      if (rest && !isBadProxyIp(rest)) viaIp = rest;
+      return true;
+    }
+    return false;
+  }
+  if (!matchVpnPath(path) && !matchVpnPath('/vpnws')) {
     if (hasDB(env)) {
       try {
         path = normPath((await settingGet(env.DB, 'vpn_path')) || '/vpnws');
         VPN_PATH_MEM = path;
       } catch (e) {}
     }
-    if (pn !== path && pn !== path + '/' && pn !== '/vpnws' && pn !== '/vpnws/') {
+    if (!matchVpnPath(path) && !matchVpnPath('/vpnws')) {
       return new Response('Not found', { status: 404 });
     }
   }
@@ -1789,7 +1813,7 @@ async function handleVpnUpgrade(request, env, ctx, url) {
   var early = parseEarly(proto);
   var headers = { Upgrade: 'websocket' };
   if (proto) headers['Sec-WebSocket-Protocol'] = proto.split(',')[0].trim();
-  var task = runTunnel(server, env, ctx, clientIp(request), pump, early).then(function () {
+  var task = runTunnel(server, env, ctx, clientIp(request), pump, early, viaIp).then(function () {
     shutWs();
   }).catch(function () {
     shutWs();
@@ -1852,7 +1876,6 @@ async function handleApi(request, env, url) {
     var password = String(body.password || '');
     var email = String(body.email || '').trim();
     var lang = body.lang === 'en' ? 'en' : 'fa';
-    var cfToken = String(body.cf_token || '').trim();
     var tgTokIn = String(body.tg_token || '').trim();
     var tgChatIn = String(body.tg_chat || '').trim();
     var recIn = normOtp(body.recovery);
@@ -1881,7 +1904,6 @@ async function handleApi(request, env, url) {
     var created = await dbFirst(env.DB, 'SELECT id FROM users WHERE username = ?', username);
     await settingSet(env.DB, 'panel_name', 'Ham');
     await settingSet(env.DB, 'lang', lang);
-    if (cfToken) await settingSet(env.DB, 'cf_token', cfToken);
     await settingSet(env.DB, 'tg_token', tgTokIn);
     await settingSet(env.DB, 'tg_chat', tgChatIn);
     var recSalt = crypto.getRandomValues(new Uint8Array(16));
@@ -2133,8 +2155,6 @@ async function handleApi(request, env, url) {
       city: (request.cf && request.cf.city) || '',
       asOrg: (request.cf && request.cf.asOrganization) || ''
     };
-    var cfMoney = { ok: false, used_h: '', left_h: '—' };
-    try { cfMoney = await cfAccountMoney(env.DB); } catch (eCf) {}
     try {
       var alpeers = await dbAll(env.DB, 'SELECT * FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 LIMIT 80');
       var ap;
@@ -2176,7 +2196,6 @@ async function handleApi(request, env, url) {
       used_h: fmtBytes(usedSum),
       subs: (scount && scount.c) || 0,
       loc: loc,
-      cf_money: cfMoney,
       health: health,
       daily: daily,
       cfgs: (await dbAll(env.DB, 'SELECT id, name, used_bytes, quota_bytes, expire_at, enabled, location FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 ORDER BY id DESC LIMIT 40')).map(function (row) {
@@ -2318,7 +2337,10 @@ async function handleApi(request, env, url) {
         cf_ports: cfSaved.join(','),
         tg_token: await settingGet(env.DB, 'tg_token'),
         tg_chat: await settingGet(env.DB, 'tg_chat'),
-        cf_token_set: (await settingGet(env.DB, 'cf_token')) ? '1' : '0',
+        bypass_fp: (await settingGet(env.DB, 'bypass_fp')) || 'chrome',
+        bypass_ech: (await settingGet(env.DB, 'bypass_ech')) === '1' ? '1' : '0',
+        bypass_fragment: (await settingGet(env.DB, 'bypass_fragment')) === '1' ? '1' : '0',
+        bypass_0rtt: (await settingGet(env.DB, 'bypass_0rtt')) === '1' ? '1' : '0',
         admin_email_set: (await settingGet(env.DB, 'admin_email')) ? '1' : '0',
         allow_ips: await settingGet(env.DB, 'allow_ips'),
         abuse_gb: (await settingGet(env.DB, 'abuse_gb')) || '80',
@@ -2341,6 +2363,10 @@ async function handleApi(request, env, url) {
     if (typeof sb.panel_name === 'string' && sb.panel_name.trim()) await settingSet(env.DB, 'panel_name', sb.panel_name.trim().slice(0, 40));
     if (sb.lang === 'fa' || sb.lang === 'en') await settingSet(env.DB, 'lang', sb.lang);
     if (typeof sb.vpn_path === 'string') await settingSet(env.DB, 'vpn_path', normPath(sb.vpn_path));
+    if (typeof sb.bypass_fp === 'string' && sb.bypass_fp.trim()) await settingSet(env.DB, 'bypass_fp', sb.bypass_fp.trim().slice(0, 24));
+    if (sb.bypass_ech === '1' || sb.bypass_ech === '0') await settingSet(env.DB, 'bypass_ech', sb.bypass_ech);
+    if (sb.bypass_fragment === '1' || sb.bypass_fragment === '0') await settingSet(env.DB, 'bypass_fragment', sb.bypass_fragment);
+    if (sb.bypass_0rtt === '1' || sb.bypass_0rtt === '0') await settingSet(env.DB, 'bypass_0rtt', sb.bypass_0rtt);
     if (typeof sb.allow_ips === 'string') await settingSet(env.DB, 'allow_ips', sb.allow_ips);
     if (typeof sb.abuse_gb === 'string' || typeof sb.abuse_gb === 'number') await settingSet(env.DB, 'abuse_gb', String(parseInt(sb.abuse_gb, 10) || 0));
     if (sb.access_only === '1' || sb.access_only === '0') await settingSet(env.DB, 'access_only', sb.access_only);
@@ -2379,11 +2405,7 @@ async function handleApi(request, env, url) {
     }
     if (typeof sb.tg_token === 'string') await settingSet(env.DB, 'tg_token', sb.tg_token.trim());
     if (typeof sb.tg_chat === 'string') await settingSet(env.DB, 'tg_chat', sb.tg_chat.trim());
-    if (typeof sb.cf_token === 'string') {
-      var cft = sb.cf_token.trim();
-      if (cft === '-') await settingSet(env.DB, 'cf_token', '');
-      else if (cft) await settingSet(env.DB, 'cf_token', cft);
-    }
+    /* cf_token removed from panel */
     var tokNow = await settingGet(env.DB, 'tg_token');
     if (tokNow) {
       try {
@@ -2793,7 +2815,9 @@ async function handleApi(request, env, url) {
       });
     }
     var hostsS = String(await settingGet(env.DB, 'extra_hosts') || '').split(/\n/).map(function (x) { return x.trim(); }).filter(Boolean);
-    return json({ ok: true, ports: portsOnS, ports_all: CF_ALL, ports_http: CF_HTTP, ports_https: CF_HTTPS, hosts: hostsS, subs: outS });
+    var useIpsS = [];
+    try { useIpsS = await enabledIps(env.DB); } catch (eIs) { useIpsS = []; }
+    return json({ ok: true, ports: portsOnS, ports_all: CF_ALL, ports_http: CF_HTTP, ports_https: CF_HTTPS, hosts: hostsS, ips: useIpsS, subs: outS });
   }
 
   if (path === '/api/sub' && method === 'POST') {
@@ -2832,7 +2856,7 @@ async function handleApi(request, env, url) {
           srow2.id);
       } catch (esu) {}
     }
-    var nlinks = cleanPorts(sports, false).length * cleanProtos(sprotos).length;
+    var nlinks = parseIpLines(sbx.ips).length || 1;
     await audit(env.DB, me.id, 'sub_create', sname + ' x' + nlinks, ip);
     return json({ ok: true, url: url.origin + '/sub/' + stok, token: stok, count: nlinks });
   }
@@ -3399,7 +3423,22 @@ async function handleTelegram(request, env, url) {
       return json({ ok: true });
     }
     if (text === 'ساخت سابسکراپشن' || text === '/sub' || text === 'لینک سابسکراپشن') {
-      await send('در نسخه ۱ سابسکراپشن نیست. از ساخت فیلترشکن استفاده کنید.');
+      var sname = String.fromCharCode(65 + Math.floor(Math.random() * 26)) + Math.floor(1000 + Math.random() * 9000);
+      var suuid = crypto.randomUUID();
+      var stok = randomToken().slice(0, 24);
+      var sipTg = '';
+      try { sipTg = (await enabledIps(env.DB)).join(','); } catch (eSip) {}
+      await dbRun(
+        env.DB,
+        'INSERT INTO vpn_subs (token, name, protocols, created_at, expire_at, quota_bytes, uuid, trojan_pass, ports, location, max_ip, used_bytes, enabled, fragment, mux, brand, logo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 0, 0, ?, ?)',
+        stok, sname, 'vless', nowIso(), daysToExpire(30), 0, suuid, suuid, '443', '', 0, sname, ''
+      );
+      var snew = await dbFirst(env.DB, 'SELECT id FROM vpn_subs WHERE token = ?', stok);
+      if (snew && sipTg) {
+        try { await dbRun(env.DB, 'UPDATE vpn_subs SET ips = ? WHERE id = ?', sipTg, snew.id); } catch (eIp) {}
+      }
+      var surl = url.origin + '/sub/' + stok;
+      await send('ساب ساخته شد: ' + sname + '\n۳۰ روز · حجم نامحدود\nهر آی‌پی تیک‌خورده = یک کانفیگ\n\n' + surl);
       return json({ ok: true });
     }
     if (false && (text === 'ساخت سابسکراپشن-off')) {
@@ -3880,7 +3919,7 @@ aside{display:none}
 .nav a.on:hover{color:#fff}
 main{padding:24px 20px 40px;max-width:1100px;width:100%;margin:0 auto}
 .top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin:0 0 20px}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(4,1fr)}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(3,1fr)}
 .stat{padding:16px}
 .stat:before{display:none}
 .stat b{display:block;font-size:26px;margin-top:6px}
@@ -4065,6 +4104,8 @@ vpn_h2:'آیفون: Streisand یا V2Box — لینک را Share/Import کنید
 vpn_h3:'ویندوز: v2rayN یا Hiddify — Import from clipboard.',
 vpn_off:'خاموش', vpn_on:'روشن', share:'لینک اتصال',
 sub:'سابسکراپشن', sub_help:'چند کانفیگ را در یک لینک می‌گیرید. همان لینک را در Hiddify یا v2rayNG به‌عنوان ساب وارد کنید.',
+bypass:'دورزدن پیشرفته', bypass_h:'روی همه لینک‌های VLESS اعمال می‌شود. کلاینت باید این گزینه‌ها را بفهمد.',
+fp:'Fingerprint',
 sub_count:'تعداد کانفیگ', sub_make:'ساخت سابسکراپشن',
 vpn_loc:'لوکیشن', vpn_uuid_ph:'خالی = تصادفی', vpn_uuid_rand:'تصادفی',
 vpn_tpass:'رمز Trojan', vpn_tpass_ph:'خالی = همان UUID',
@@ -4082,7 +4123,7 @@ sub_brand:'برند ساب',
 tg:'تلگرام', tg_token:'توکن ربات', tg_chat:'Chat ID', tg_h:'وقتی حجم یا زمان تمام شود پیام می‌فرستد. ربات با /vpn و /sub کانفیگ می‌سازد.', tg_test:'ارسال تست',
 backup:'پشتیبان JSON', backup_dl:'دانلود بکاپ', backup_up:'بازیابی از فایل',
 chart:'ترافیک روزانه', sub_ports:'پورت‌ها — هر پورت یک کانفیگ',
-sub_help2:'با ساخت ساب چیزی به منوی فیلترشکن اضافه نمی‌شود. به ازای هر پورت و هر پروتکل یک لینک با اسم مثل 443 Ham vless ساخته می‌شود.',
+sub_help2:'به ازای هر آی‌پی که تیک بزنید یک کانفیگ داخل ساب است. خط اول ساب مصرف، مانده و زمان را نشان می‌دهد و با هر بروزرسانی عوض می‌شود.',
 vpn_one_port:'برای فیلترشکن فقط یک پورت', vpn_one_proto:'برای فیلترشکن فقط یک پروتکل',
 edit:'ویرایش', update:'به‌روزرسانی', edit_vpn:'ویرایش کانفیگ', edit_sub:'ویرایش ساب',
 edit_sub_h:'پورت، حجم و زمان را عوض کن. بعد از ذخیره، کاربر با بروزرسانی لینک ساب کانفیگ جدید را می‌گیرد.',
@@ -4196,6 +4237,8 @@ vpn_h2:'iPhone: Streisand or V2Box — import the link.',
 vpn_h3:'Windows: v2rayN or Hiddify — import from clipboard.',
 vpn_off:'Off', vpn_on:'On', share:'Share link',
 sub:'Subscription', sub_help:'Bundle several configs into one URL and import it in Hiddify or v2rayNG as a subscription.',
+bypass:'Advanced bypass', bypass_h:'Applied to every VLESS link. The client must support these options.',
+fp:'Fingerprint',
 sub_count:'Config count', sub_make:'Create subscription',
 vpn_loc:'Location', vpn_uuid_ph:'blank = random', vpn_uuid_rand:'Random',
 vpn_tpass:'Trojan password', vpn_tpass_ph:'blank = same as UUID',
@@ -4213,7 +4256,7 @@ sub_brand:'Sub brand',
 tg:'Telegram', tg_token:'Bot token', tg_chat:'Chat ID', tg_h:'Sends a message when quota or time runs out. The bot also creates configs with /vpn and /sub.', tg_test:'Send test',
 backup:'JSON backup', backup_dl:'Download backup', backup_up:'Restore from file',
 chart:'Daily traffic', sub_ports:'Ports — one config per port',
-sub_help2:'Creating a subscription does not add items to the VPN menu. Each selected port and protocol becomes one link named like 443 Ham vless.',
+sub_help2:'Each ticked IP becomes one config in the subscription. The first line shows used, remaining quota and time, and updates on every refresh.',
 vpn_one_port:'VPN configs allow a single port', vpn_one_proto:'VPN configs allow a single protocol',
 edit:'Edit', update:'Update', edit_vpn:'Edit config', edit_sub:'Edit subscription',
 edit_sub_h:'Change ports, quota and time. After save, clients get the new configs on the next subscription refresh.',
@@ -4653,6 +4696,7 @@ function shell(content){
     '<nav class="nav">',
     navItem('/', 'dash'),
     navItem('/vpn', 'vpn'),
+    navItem('/sub', 'sub'),
     navItem('/logs', 'logs'),
     navItem('/settings', 'settings'),
     '</nav>',
@@ -4671,6 +4715,7 @@ function shell(content){
 function renderApp(){
   S.view = route();
   if (S.view === '/vpn') return viewVpn();
+  if (S.view === '/sub') return viewSub();
   if (S.view === '/logs') return viewLogs();
   if (S.view === '/settings') return viewSettings();
   return viewDash();
@@ -4767,14 +4812,28 @@ function subModal(s){
     '<div class="field"><label>', esc(t('vpn_maxip')), '</label><input class="input" name="max_ip" type="number" min="0" value="', esc(s ? String(s.max_ip||0) : '0'), '"></div>',
     '</div>',
     '<div class="field"><label>', esc(t('vpn_proto')), '</label><div class="chkgrid">',
-    '<label class="pill"><input type="checkbox" name="p_vless"', protos.indexOf('vless')!==-1?' checked':'', '> VLESS</label>',
-    '<label class="pill"><input type="checkbox" name="p_trojan"', protos.indexOf('trojan')!==-1?' checked':'', '> Trojan</label>',
+    '<label class="pill"><input type="radio" name="proto" value="vless" checked> VLESS</label>',
     '</div></div>',
-    '<div class="field"><label>', esc(t('sub_ports')), '</label>', portBoxes('port', true, ports), '</div>',
-    '<div class="split"><div class="field"><label>', esc(t('speed')), '</label><input class="input" name="speed_mbps" type="number" min="0" step="0.1" value="', esc(s ? String(((Number(s.speed_kbps)||0)/1024)) : '0'), '"></div>',
-    '<div class="field"><label>', esc(t('extra_host')), '</label>', hostSelect('extra_host', s ? (s.extra_host||'') : ''), '</div></div>',
-    '<div class="split"><div class="field"><label>', esc(t('sub_pass')), '</label><input class="input" name="sub_pass" value="', esc(s ? (s.sub_pass||'') : ''), '"></div>',
-    '<div class="field"><label class="pill"><input type="checkbox" name="one_shot"', (s && Number(s.one_shot)) ? ' checked' : '', '> ', esc(t('one_shot')), '</label></div></div>',
+    '<div class="field"><label>', esc(t('port')), ' · ', esc(t('vpn_one_port')), '</label>', portBoxes('port', false, ports.length ? [ports[0]] : []), '</div>',
+    '<div class="field"><label>', esc(t('speed')), '</label><input class="input" name="speed_mbps" type="number" min="0" step="0.1" value="', esc(s ? String(((Number(s.speed_kbps)||0)/1024)) : '0'), '"></div>',
+    (function(){
+      var pool = (S.vpnIps || []).slice();
+      var sel = {};
+      var raw = String((s && s.ips) || '').split(/[\s,]+/).filter(Boolean);
+      var k;
+      for (k = 0; k < raw.length; k++) sel[raw[k]] = 1;
+      if (!pool.length) return '<p class="hint">' + esc(t('vpn_ip_none')) + '</p>';
+      var html = '<div class="field"><label>' + esc(t('vpn_ip_pick')) + '</label><div class="hint">' + esc(t('sub_help2')) + '</div>';
+      html += '<div class="chkgrid">';
+      var i, ip, g;
+      for (i = 0; i < pool.length; i++){
+        ip = pool[i];
+        g = (S.ipGeo && S.ipGeo[ip]) ? (S.ipGeo[ip].cc || S.ipGeo[ip].country) : '';
+        html += '<label class="pill"><input type="checkbox" name="sub_ip" value="' + esc(ip) + '"' + (sel[ip]?' checked':'') + '> ' + esc(ip) + (g ? ' · ' + esc(g) : '') + '</label>';
+      }
+      try { requestIpGeo(pool); } catch (eG3) {}
+      return html + '</div></div>';
+    })(),
     '<div class="row" style="justify-content:flex-end"><button class="btn" type="button" data-act="modal-close">', esc(t('cancel')), '</button>',
     '<button class="btn primary" type="submit">', esc(s ? t('update') : t('sub_make')), '</button></div></form></div></div>'
   );
@@ -4866,6 +4925,7 @@ function viewSub(){
     if (!d.ok){ shell(h('<div class="err">', esc(d.error || t('err')), '</div>')); return; }
     S.meta = { ports: d.ports || [] };
     S.hosts = d.hosts || [];
+    S.vpnIps = d.ips || [];
     S.subList = d.subs || [];
     var rows = (d.subs || []).map(function(s){
       var exp = s.remain_days != null && s.remain_days >= 0 ? (String(s.remain_days) + 'd') : '∞';
@@ -4909,11 +4969,6 @@ function viewDash(){
       '<div class="card stat"><div class="muted">', esc(t('vpn')), '</div><b>', esc(d.peers_on || 0), '</b><div class="muted" style="font-size:11px">', esc(d.peers || 0), '</div></div>',
       '<div class="card stat"><div class="muted">', esc(t('vpn_traffic')), '</div><b>', esc(d.used_h || '0 B'), '</b></div>',
             '<div class="card stat"><div class="muted">', esc(t('vpn_loc')), '</div><b>', esc((d.loc && (d.loc.country || d.loc.colo)) || '—'), '</b><div class="muted" style="font-size:11px">', esc((d.loc && (d.loc.city || d.loc.colo)) || ''), '</div></div>',
-      '<div class="card stat"><div class="muted">', esc(t('cf')), '</div>',
-      (d.cf_money && d.cf_money.ok
-        ? h('<b>', esc(t('cf_spend')), ' ', esc(d.cf_money.used_h), '</b><div class="muted" style="font-size:11px">', esc(t('cf_left')), ' ', esc(d.cf_money.left_h), '</div>')
-        : h('<b style="font-size:13px">', esc(t('cf_no_tok')), '</b>')),
-      '</div>',
       '</div>',
       '<div class="card" style="margin-top:14px;padding:16px">',
       '<span class="pill ok">', esc(t('vpn_edge')), '</span> <span class="muted">', esc((d.loc && d.loc.asOrg) || 'Cloudflare'), ' · ', esc((d.loc && d.loc.colo) || ''), '</span>',
@@ -5141,10 +5196,20 @@ function viewSettings(){
       '<div class="field"><label>', esc(t('lang')), '</label><select name="lang"><option value="fa"', s.lang==='fa'?' selected':'', '>فارسی</option><option value="en"', s.lang==='en'?' selected':'', '>English</option></select></div>',
       '<h3 style="margin:8px 0 12px">', esc(t('vpn_proxy')), '</h3>',
       '<div class="field"><label>', esc(t('vpn_path')), '</label><input class="input" name="vpn_path" value="', esc(s.vpn_path || '/vpnws'), '"></div>',
-            '<h3 style="margin:8px 0 12px">', esc(t('set_sec')), '</h3>',
+      '<h3 style="margin:8px 0 12px">', esc(t('bypass')), '</h3>',
+      '<p class="hint">', esc(t('bypass_h')), '</p>',
+      '<div class="field"><label>', esc(t('fp')), '</label><select class="input" name="bypass_fp">',
+      ['chrome','firefox','safari','ios','android','edge','randomized'].map(function(fp){
+        return '<option value="'+fp+'"'+(String(s.bypass_fp||'chrome')===fp?' selected':'')+'>'+fp+'</option>';
+      }).join(''),
+      '</select></div>',
+      '<div class="row" style="margin-bottom:12px;gap:8px;flex-wrap:wrap">',
+      '<label class="pill"><input type="checkbox" name="bypass_ech"', s.bypass_ech==='1'?' checked':'', '> ECH</label>',
+      '<label class="pill"><input type="checkbox" name="bypass_fragment"', s.bypass_fragment==='1'?' checked':'', '> TLS fragment</label>',
+      '<label class="pill"><input type="checkbox" name="bypass_0rtt"', s.bypass_0rtt==='1'?' checked':'', '> 0-RTT</label>',
+      '</div>',
+      '<h3 style="margin:8px 0 12px">', esc(t('set_sec')), '</h3>',
       '<div class="field"><label>', esc(t('set_panel_path')), '</label><input class="input" name="panel_path" value="', esc(s.panel_path || '/dash'), '"><div class="hint">', esc(t('set_panel_path_h')), '</div></div>',
-      '<h3 style="margin:8px 0 12px">', esc(t('cf')), '</h3>',
-      '<div class="field"><label>', esc(t('cf_tok')), '</label><input class="input" name="cf_token" placeholder="Bearer token" value="" autocomplete="off"><div class="hint">', esc(s.cf_token_set === '1' ? t('cf_tok_saved') : t('cf_hint')), '</div></div>',
       '<div class="field"><label>', esc(t('allow_ips')), '</label><textarea class="input" name="allow_ips" rows="3" placeholder="1.2.3.4\n5.6.7.0/24">', esc(s.allow_ips || ''), '</textarea><div class="hint">', esc(t('allow_ips_h')), '</div></div>',
       '<div class="field"><label>', esc(t('abuse_gb')), '</label><input class="input" name="abuse_gb" type="number" min="0" value="', esc(s.abuse_gb || '80'), '"><div class="hint">', esc(t('abuse_gb_h')), '</div></div>',
       '<label class="pill" style="margin-bottom:12px"><input type="checkbox" name="access_only"', s.access_only==='1'?' checked':'', '> ', esc(t('access_only')), '</label><div class="hint">', esc(t('access_only_h')), '</div>',
@@ -5700,18 +5765,15 @@ document.getElementById('app').addEventListener('submit', function(e){
     return;
   }
   if (form === 'sub-add' || form === 'sub-edit'){
-    var sprotos = [];
-    if (f.querySelector('[name=p_vless]') && f.querySelector('[name=p_vless]').checked) sprotos.push('vless');
-    if (f.querySelector('[name=p_trojan]') && f.querySelector('[name=p_trojan]').checked) sprotos.push('trojan');
+    var sip = Array.prototype.map.call(f.querySelectorAll('[name=sub_ip]:checked'), function(c){ return c.value; }).join(',');
     var sbody = {
       name: fd.get('name'), brand: fd.get('name'),
-      quota_gb: fd.get('quota_gb'), days: fd.get('days'), location: fd.get('location'),
+      quota_gb: fd.get('quota_gb'), days: fd.get('days'),
       max_ip: fd.get('max_ip'),
-      protocols: sprotos.join(',') || 'vless',
+      protocols: 'vless',
       ports: pickedPorts(f, 'port').join(',') || '443',
-      speed_mbps: fd.get('speed_mbps'), extra_host: fd.get('extra_host'),
-      sub_pass: fd.get('sub_pass') || '',
-      one_shot: !!(f.querySelector('[name=one_shot]') && f.querySelector('[name=one_shot]').checked)
+      speed_mbps: fd.get('speed_mbps'),
+      ips: sip
     };
     var sreq = form === 'sub-edit' ? api('/api/sub/' + fd.get('id'), 'PATCH', sbody) : api('/api/sub','POST', sbody);
     sreq.then(function(r){
@@ -5724,6 +5786,10 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (fd.get('panel_name') != null) payload.panel_name = fd.get('panel_name');
     if (fd.get('lang') != null) payload.lang = fd.get('lang');
     if (fd.get('vpn_path') != null) payload.vpn_path = fd.get('vpn_path');
+    if (fd.get('bypass_fp') != null) payload.bypass_fp = fd.get('bypass_fp');
+    if (f.querySelector('[name=bypass_ech]')) payload.bypass_ech = f.querySelector('[name=bypass_ech]').checked ? '1' : '0';
+    if (f.querySelector('[name=bypass_fragment]')) payload.bypass_fragment = f.querySelector('[name=bypass_fragment]').checked ? '1' : '0';
+    if (f.querySelector('[name=bypass_0rtt]')) payload.bypass_0rtt = f.querySelector('[name=bypass_0rtt]').checked ? '1' : '0';
     if (fd.get('panel_path') != null) payload.panel_path = fd.get('panel_path');
     if (fd.get('allow_ips') != null) payload.allow_ips = fd.get('allow_ips') || '';
     if (fd.get('abuse_gb') != null) payload.abuse_gb = fd.get('abuse_gb') || '0';
@@ -5731,7 +5797,7 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (f.querySelector('[name=cf_port]')) payload.cf_ports = pickedPorts(f, 'cf_port').join(',');
     if (fd.get('tg_token') != null) payload.tg_token = fd.get('tg_token');
     if (fd.get('tg_chat') != null) payload.tg_chat = fd.get('tg_chat');
-    if (fd.get('cf_token') != null && String(fd.get('cf_token') || '').trim()) payload.cf_token = fd.get('cf_token');
+    /* no cf_token */
     if (fd.get('admin_email') != null && String(fd.get('admin_email') || '').trim()) payload.admin_email_new = fd.get('admin_email');
     if (f.querySelector('[name=tg_2fa]')) payload.tg_2fa = f.querySelector('[name=tg_2fa]').checked ? '1' : '0';
     if (f.querySelector('[name=proxy_ips]')) {
