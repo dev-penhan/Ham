@@ -9,6 +9,7 @@ var VPN_SCHEMA_OK = false;
 var VPN_PATH_MEM = '/vpnws';
 var RUNTIME_ENV = null;
 var CAMO_URL = 'https://ubuntu.com/';
+var PANEL_MEM = { t: 0, path: '/dash', camo: 'https://ubuntu.com/' };
 
 const SCHEMA =
   'CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);' +
@@ -92,7 +93,9 @@ function json(data, status, headers) {
   var h = {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store, no-cache, must-revalidate',
-    'pragma': 'no-cache'
+    'pragma': 'no-cache',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY'
   };
   if (headers) {
     var k;
@@ -169,17 +172,62 @@ function ipAllowed(ip, list) {
   return false;
 }
 
+async function verifyAccessJwt(request) {
+  var tok = request.headers.get('CF-Access-Jwt-Assertion') || '';
+  var parts = tok.split('.');
+  if (parts.length !== 3) return false;
+  var payload;
+  try {
+    payload = JSON.parse(utf8FromB64url(parts[1]));
+  } catch (e0) { return false; }
+  if (!payload || (payload.exp && Number(payload.exp) * 1000 < Date.now() - 30000)) return false;
+  if (payload.nbf && Number(payload.nbf) * 1000 > Date.now() + 30000) return false;
+  var iss = String(payload.iss || '').replace(/\/$/, '');
+  if (iss.indexOf('https://') !== 0) return false;
+  try {
+    var certs = await fetch(iss + '/cdn-cgi/access/certs');
+    if (!certs.ok) return false;
+    var jwks = await certs.json();
+    var keys = (jwks && jwks.keys) || [];
+    var hdr = JSON.parse(utf8FromB64url(parts[0]));
+    var kid = hdr && hdr.kid;
+    var jwk = null;
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      if (!kid || keys[i].kid === kid) { jwk = keys[i]; break; }
+    }
+    if (!jwk || !jwk.n || !jwk.e) return false;
+    var key = await crypto.subtle.importKey(
+      'jwk',
+      { kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RS256', ext: true },
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    var sig = b64urlToU8(parts[2]);
+    var data = new TextEncoder().encode(parts[0] + '.' + parts[1]);
+    return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, data);
+  } catch (e1) {
+    return false;
+  }
+}
+
+function utf8FromB64url(s) {
+  var u = b64urlToU8(s);
+  return new TextDecoder().decode(u);
+}
+
 async function panelAllow(env, request) {
   if (!hasDB(env)) return true;
   try {
     if ((await settingGet(env.DB, 'access_only')) === '1') {
-      if (!request.headers.get('CF-Access-Jwt-Assertion')) return false;
+      if (!(await verifyAccessJwt(request))) return false;
     }
     var list = parseAllowList(await settingGet(env.DB, 'allow_ips'));
     if (!list.length) return true;
     return ipAllowed(clientIp(request), list);
   } catch (e) {
-    return true;
+    return false;
   }
 }
 
@@ -253,6 +301,11 @@ function normOtp(s) {
   return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
 }
 
+async function otpHash(token, code) {
+  var raw = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('ham.otp.v1|' + String(token || '') + '|' + normOtp(code)));
+  return b64(raw);
+}
+
 function validEmail(s) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim());
 }
@@ -323,9 +376,14 @@ async function readJson(request) {
 
 function originOk(request) {
   var origin = request.headers.get('Origin');
-  if (!origin) return true;
+  var host = new URL(request.url).host;
+  if (!origin) {
+    var sec = (request.headers.get('Sec-Fetch-Site') || '').toLowerCase();
+    if (sec === 'cross-site') return false;
+    return true;
+  }
   try {
-    return new URL(origin).host === new URL(request.url).host;
+    return new URL(origin).host === host;
   } catch (e) {
     return false;
   }
@@ -362,7 +420,8 @@ async function isSetup(db) {
   }
 }
 
-var SECRET_SETTING = { tg_token: 1, cf_token: 1 };
+var SECRET_SETTING = { tg_token: 1, cf_token: 1, tg_hook_secret: 1 };
+var BACKUP_SKIP = { install_key: 1, recovery_hash: 1, recovery_salt: 1, tg_token: 1, cf_token: 1, tg_hook_secret: 1, email_chg: 1 };
 
 async function installKey(db) {
   var k = '';
@@ -403,7 +462,7 @@ async function secretSeal(db, plain) {
     mixed.set(new Uint8Array(ct), 12);
     return 'enc:v1:' + b64(mixed);
   } catch (e) {
-    return plain;
+    throw new Error('secret seal failed');
   }
 }
 
@@ -446,6 +505,31 @@ async function settingGet(db, key) {
 async function settingSet(db, key, value) {
   if (SECRET_SETTING[key]) value = await secretSeal(db, value);
   await dbRun(db, 'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, value);
+}
+
+async function packBackup(db, encrypt) {
+  var bset = await dbAll(db, 'SELECT key, value FROM settings');
+  var outSet = [];
+  var i, row;
+  for (i = 0; i < (bset || []).length; i++) {
+    row = bset[i];
+    if (!row || !row.key || BACKUP_SKIP[row.key]) continue;
+    outSet.push({ key: row.key, value: row.value });
+  }
+  var bpeers = await dbAll(db, 'SELECT * FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0');
+  var bsubs = await dbAll(db, 'SELECT * FROM vpn_subs');
+  var inner = JSON.stringify({ ham: 1, exported_at: nowIso(), settings: outSet, peers: bpeers || [], subs: bsubs || [] });
+  if (!encrypt) return inner;
+  var sealed = await secretSeal(db, inner);
+  return JSON.stringify({ ham: 1, v: 2, enc: sealed });
+}
+
+async function ensureTgHookSecret(db) {
+  var h = await settingGet(db, 'tg_hook_secret');
+  if (h) return h;
+  h = randomToken();
+  await settingSet(db, 'tg_hook_secret', h);
+  return h;
 }
 
 function pickNum() {
@@ -947,7 +1031,7 @@ async function checkMaxIp(db, kind, id, ip, maxIp) {
     );
     return true;
   } catch (e) {
-    return true;
+    return false;
   }
 }
 
@@ -1210,6 +1294,28 @@ function isBadProxyIp(s) {
   return false;
 }
 
+function isCfAnycastIp(s) {
+  var n = ipv4Num(s);
+  if (n == null) return false;
+  function inr(a, b) { return n >= ipv4Num(a) && n <= ipv4Num(b); }
+  if (inr('1.0.0.0', '1.1.1.255')) return true;
+  if (inr('104.16.0.0', '104.31.255.255')) return true;
+  if (inr('172.64.0.0', '172.71.255.255')) return true;
+  if (inr('162.158.0.0', '162.159.255.255')) return true;
+  if (inr('198.41.128.0', '198.41.255.255')) return true;
+  if (inr('188.114.96.0', '188.114.111.255')) return true;
+  if (inr('173.245.48.0', '173.245.63.255')) return true;
+  if (inr('141.101.64.0', '141.101.127.255')) return true;
+  if (inr('108.162.192.0', '108.162.255.255')) return true;
+  if (inr('190.93.240.0', '190.93.255.255')) return true;
+  if (inr('197.234.240.0', '197.234.255.255')) return true;
+  if (inr('103.21.244.0', '103.21.247.255')) return true;
+  if (inr('103.22.200.0', '103.22.203.255')) return true;
+  if (inr('103.31.4.0', '103.31.7.255')) return true;
+  if (inr('131.0.72.0', '131.0.75.255')) return true;
+  return false;
+}
+
 function tlsName(o) {
   var c = [o && o.sni, o && o.wsHost, o && o.host];
   var i;
@@ -1237,12 +1343,12 @@ function vlessLink(uuid, o, name, port, extra, addr, viaIp) {
   port = Number(port) || 443;
   var tls = isTlsPort(port);
   var domain = tlsName(o);
-  var server = wrapAddr(addr || domain);
-  if (isIpAddr(server) || isBadProxyIp(String(addr || ''))) server = wrapAddr(domain);
+  var pick = String(viaIp || addr || domain || '').trim();
+  var server;
+  if (isIpAddr(pick) && !isBadProxyIp(pick)) server = wrapAddr(pick);
+  else if (pick && !isIpAddr(pick)) server = wrapAddr(pick);
+  else server = wrapAddr(domain);
   var path = o.path || '/vpnws';
-  if (viaIp && !isBadProxyIp(viaIp)) {
-    path = path + '/' + String(viaIp).replace(/[^0-9A-Za-z.:]/g, '');
-  }
   var q = 'encryption=none&security=' + (tls ? 'tls' : 'none');
   if (tls) {
     q += '&sni=' + encodeURIComponent(domain) + '&fp=' + encodeURIComponent((o && o.fp) || 'chrome');
@@ -1275,7 +1381,11 @@ function peerLinks(pr, o) {
   var extra = extraQuery(pr, o);
   var protos = cleanProtos(pr.protocols);
   var pass = pr.trojan_pass || pr.uuid;
-  var addrs = addrList(pr, o);
+  var addrs = [];
+  var viaIps = parseIpLines(pr && pr.ips);
+  var vi;
+  for (vi = 0; vi < viaIps.length; vi++) if (!isBadProxyIp(viaIps[vi])) addrs.push(viaIps[vi]);
+  if (!addrs.length) addrs = addrList(pr, o);
   var out = { items: [] };
   var i, a, proto, remark, link;
   for (a = 0; a < addrs.length; a++) {
@@ -1316,9 +1426,9 @@ function subLinkList(su, o) {
     via = vias[i];
     remark = brand;
     if (via) remark = brand + ' · ' + via;
-    link = vlessLink(su.uuid, o, remark, port, extra, server, via);
+    link = vlessLink(su.uuid, o, remark, port, extra, via || server);
     lines.push(link);
-    clash.push({ name: remark, type: 'vless', uuid: su.uuid, port: port, tls: isTlsPort(port), server: server });
+    clash.push({ name: remark, type: 'vless', uuid: su.uuid, port: port, tls: isTlsPort(port), server: (via && !isBadProxyIp(via)) ? via : server });
   }
   return { lines: lines, clash: clash, count: lines.length };
 }
@@ -1522,21 +1632,22 @@ async function proxyTcp(ws, info, meter, pump) {
   var host = String(info.host || '').replace(/^\[|\]$/g, '').replace(/\s+/g, '');
   var port = Number(info.port) || 0;
   if (!host || !port || host.length > 255) { try { ws.close(); } catch (e0) {} return; }
-  var proxies = (meter && meter.proxies) ? meter.proxies : [];
-  var addrs = [];
-  function addAddr(h) {
-    h = String(h || '').trim();
-    if (!h) return;
-    if (addrs.indexOf(h) === -1) addrs.push(h);
+  var addrs = [host];
+  var raw = (meter && meter.proxies) ? meter.proxies : [];
+  var ti, p;
+  for (ti = 0; ti < raw.length; ti++) {
+    p = String(raw[ti] || '').trim();
+    if (!p || p === host || isBadProxyIp(p) || isCfAnycastIp(p)) continue;
+    if (addrs.indexOf(p) === -1) addrs.push(p);
   }
-  addAddr(host);
-  var addrsTry = [host, host];
-  var ti;
-  for (ti = 0; ti < proxies.length; ti++) {
-    if (String(proxies[ti] || '') !== host) addrsTry.push(proxies[ti]);
+  if (addrs.length === 1 && !isIPv4(host) && host.indexOf(':') === -1) {
+    try {
+      var resolved = await resolveA(host);
+      if (resolved && resolved !== host && addrs.indexOf(resolved) === -1) addrs.push(resolved);
+    } catch (eRes) {}
   }
-  var buf = [];
-  if (info.payload && info.payload.length) buf.push(info.payload);
+  var pending = [];
+  if (info.payload && info.payload.length) pending.push(info.payload);
   var liveWriter = null;
   var closed = false;
   var up = (async function () {
@@ -1546,59 +1657,63 @@ async function proxyTcp(ws, info, meter, pump) {
       var u = await dataToU8(d);
       if (!u || !u.length) continue;
       if (meter) meter.n += u.length;
+      if (meter && meter.quota > 0 && meter.used0 + meter.n >= meter.quota) { closed = true; break; }
       if (liveWriter) {
         try { await liveWriter.write(u); } catch (eU) { break; }
-      } else buf.push(u);
+      } else pending.push(u);
     }
   })();
-  var ai, sock, writer, got, downDone, down, t0, flushed, bi;
-  addrs = addrsTry;
+  var ai, sock, writer, down, flushed, bi, got;
   for (ai = 0; ai < addrs.length; ai++) {
     if (closed) break;
     sock = null;
     writer = null;
     got = false;
-    downDone = false;
-    flushed = buf.length;
     try {
-      sock = connect({ hostname: addrs[ai], port: port });
-      writer = sock.writable.getWriter();
-      for (bi = 0; bi < flushed; bi++) await writer.write(buf[bi]);
-    } catch (e1) {
-      try { if (writer) writer.releaseLock(); } catch (e1a) {}
-      try { if (sock) sock.close(); } catch (e1b) {}
-      continue;
-    }
-    down = sock.readable.pipeTo(new WritableStream({
-      write: function (chunk) {
-        if (closed) return;
-        got = true;
-        var n = chunk.byteLength || chunk.length || 0;
-        if (meter) meter.n += n;
-        wsSend(ws, chunk);
-      },
-      close: function () { downDone = true; },
-      abort: function () { downDone = true; }
-    })).catch(function () { downDone = true; });
-    t0 = Date.now();
-    while (!got && !downDone && !closed && Date.now() - t0 < (addrs[ai] === host ? 9000 : 4000)) {
-      await new Promise(function (r) { setTimeout(r, 40); });
-    }
-    if (got) {
       try {
-        for (bi = flushed; bi < buf.length; bi++) await writer.write(buf[bi]);
-      } catch (eF) {}
-      buf = [];
+        sock = connect({ hostname: addrs[ai], port: port }, { allowHalfOpen: true });
+      } catch (eOpt) {
+        sock = connect({ hostname: addrs[ai], port: port });
+      }
+      writer = sock.writable.getWriter();
+      flushed = pending.length;
+      for (bi = 0; bi < flushed; bi++) await writer.write(pending[bi]);
+      down = sock.readable.pipeTo(new WritableStream({
+        write: function (chunk) {
+          got = true;
+          var n = chunk.byteLength || chunk.length || 0;
+          if (meter) meter.n += n;
+          if (meter && meter.quota > 0 && meter.used0 + meter.n >= meter.quota) throw new Error('quota');
+          wsSend(ws, chunk);
+        }
+      }));
+      if (ai < addrs.length - 1) {
+        var t0 = Date.now();
+        while (!got && Date.now() - t0 < 2800) {
+          await new Promise(function (r) { setTimeout(r, 25); });
+        }
+        if (!got) {
+          try { writer.abort(); } catch (eA) {}
+          try { sock.close(); } catch (eS) {}
+          continue;
+        }
+      }
+      if (pending.length > flushed) {
+        for (bi = flushed; bi < pending.length; bi++) await writer.write(pending[bi]);
+      }
+      pending = [];
       liveWriter = writer;
-      await Promise.all([down, up]);
+      await Promise.all([down.catch(function () {}), up]);
       closed = true;
       try { writer.close(); } catch (e2) {}
       try { sock.close(); } catch (e3) {}
-      try { ws.close(); } catch (e4) {}
       return;
+    } catch (e1) {
+      liveWriter = null;
+      try { if (writer) writer.releaseLock(); } catch (e1a) {}
+      try { if (sock) sock.close(); } catch (e1b) {}
+      if (got) break;
     }
-    try { writer.abort(); } catch (e5) {}
-    try { sock.close(); } catch (e6) {}
   }
   closed = true;
   try { ws.close(); } catch (e7) {}
@@ -1662,13 +1777,23 @@ async function proxyDns(ws, info, pump) {
   }
 }
 
+var PEER_MEM = { t: 0, by: {} };
 async function lookupPeer(env, buf) {
   if (!env || !env.DB) return null;
   await ensureVpn(env.DB);
   var uid = bytesToUuid(buf, 1).toLowerCase();
-  var peer = await dbFirst(env.DB, 'SELECT * FROM vpn_peers WHERE uuid = ? COLLATE NOCASE', uid);
+  var peer = null;
+  var nowm = Date.now();
+  if (PEER_MEM.t && nowm - PEER_MEM.t < 20000 && PEER_MEM.by[uid]) peer = PEER_MEM.by[uid];
   if (!peer) {
-    try { peer = await dbFirst(env.DB, 'SELECT * FROM vpn_peers WHERE uuid = ?', uid.toUpperCase()); } catch (e0) {}
+    peer = await dbFirst(env.DB, 'SELECT * FROM vpn_peers WHERE uuid = ? COLLATE NOCASE', uid);
+    if (!peer) {
+      try { peer = await dbFirst(env.DB, 'SELECT * FROM vpn_peers WHERE uuid = ?', uid.toUpperCase()); } catch (e0) {}
+    }
+    if (peer) {
+      PEER_MEM.by[uid] = peer;
+      PEER_MEM.t = nowm;
+    }
   }
   var info;
   if (peer && peerAlive(peer)) {
@@ -1731,6 +1856,8 @@ async function runTunnel(ws, env, ctx, ip, pump, early, viaIp) {
     meter.id = peer.id;
     meter.kind = peer._kind === 'sub' ? 'sub' : 'peer';
     meter.speed = Number(peer.speed_kbps) || 0;
+    meter.quota = Number(peer.quota_bytes) || 0;
+    meter.used0 = Number(peer.used_bytes) || 0;
     meter.proxies = parseIpLines(peer.ips);
     if (viaIp && (!meter.proxies.length || meter.proxies.indexOf(viaIp) !== -1)) meter.proxies = [viaIp];
     if (kind === 'vless') wsSend(ws, new Uint8Array([info.ver || 0, 0]));
@@ -1938,13 +2065,10 @@ async function handleApi(request, env, url) {
     var lb = await readJson(request);
     if (!lb) return deny('Invalid JSON', 400);
     var lp = String(lb.password || '');
-    var user = null;
-    var cand = await dbAll(env.DB, 'SELECT * FROM users WHERE active = 1 ORDER BY id ASC');
-    var ci, okHash;
-    for (ci = 0; ci < cand.length; ci++) {
-      okHash = await hashPassword(lp, fromB64(cand[ci].salt));
-      if (timingSafeEqualStr(okHash, cand[ci].password_hash)) { user = cand[ci]; break; }
-    }
+    var uname = String(lb.username || 'admin').trim().toLowerCase() || 'admin';
+    var user = await dbFirst(env.DB, 'SELECT * FROM users WHERE username = ? AND active = 1', uname);
+    var okHash = user ? await hashPassword(lp, fromB64(user.salt)) : '';
+    if (!user || !timingSafeEqualStr(okHash, user.password_hash)) user = null;
     var bad = !user;
     if (bad) {
       if (!att) await dbRun(env.DB, 'INSERT INTO login_attempts (ip, count, window_start) VALUES (?, 1, ?)', ip, nowIso());
@@ -1967,10 +2091,10 @@ async function handleApi(request, env, url) {
     var ot = randomToken().slice(0, 24);
     var exp2 = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     try {
-      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
+      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, await otpHash(ot, code), exp2);
     } catch (eotp) {
       await env.DB.exec('CREATE TABLE IF NOT EXISTS otp (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, code TEXT NOT NULL, expires_at TEXT NOT NULL);');
-      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, code, exp2);
+      await dbRun(env.DB, 'INSERT INTO otp (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)', ot, user.id, await otpHash(ot, code), exp2);
     }
     await sendLoginCodes(env, user, code);
     var rememberOn = !!(lb && (lb.remember === true || lb.remember === 1 || lb.remember === '1'));
@@ -1981,6 +2105,18 @@ async function handleApi(request, env, url) {
     var ob = await readJson(request) || {};
     var otok = String(ob.tmp || '');
     var ocode = normOtp(ob.code || '');
+    var att2k = ip + '|2fa|' + otok.slice(0, 24);
+    var att2 = await dbFirst(env.DB, 'SELECT * FROM login_attempts WHERE ip = ?', att2k);
+    if (att2) {
+      var age2 = Date.now() - Date.parse(att2.window_start);
+      if (age2 > 15 * 60 * 1000) {
+        await dbRun(env.DB, 'DELETE FROM login_attempts WHERE ip = ?', att2k);
+        att2 = null;
+      } else if (att2.count >= 8) {
+        try { await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok); } catch (eDel) {}
+        return deny('Too many attempts. Try again in 15 minutes.', 429);
+      }
+    }
     var recOk = false;
     try {
       var rh = await settingGet(env.DB, 'recovery_hash');
@@ -1992,7 +2128,19 @@ async function handleApi(request, env, url) {
     } catch (eR) {}
     var orow = await dbFirst(env.DB, 'SELECT * FROM otp WHERE token = ?', otok);
     if (!recOk) {
-      if (!orow || !timingSafeEqualStr(normOtp(orow.code), ocode) || ocode.length !== 8) return deny('Invalid code', 401);
+      var otpOk = false;
+      if (orow && ocode.length === 8) {
+        var want = await otpHash(otok, ocode);
+        otpOk = timingSafeEqualStr(orow.code, want);
+      }
+      if (!otpOk) {
+        if (!att2) await dbRun(env.DB, 'INSERT INTO login_attempts (ip, count, window_start) VALUES (?, 1, ?)', att2k, nowIso());
+        else await dbRun(env.DB, 'UPDATE login_attempts SET count = count + 1 WHERE ip = ?', att2k);
+        if (att2 && att2.count + 1 >= 8) {
+          try { await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok); } catch (eX) {}
+        }
+        return deny('Invalid code', 401);
+      }
     }
     if (!recOk) {
       if (Date.parse(orow.expires_at) < Date.now()) {
@@ -2002,6 +2150,7 @@ async function handleApi(request, env, url) {
     }
     if (!orow) return deny('Invalid code', 401);
     await dbRun(env.DB, 'DELETE FROM otp WHERE token = ?', otok);
+    try { await dbRun(env.DB, 'DELETE FROM login_attempts WHERE ip = ?', att2k); } catch (eA2) {}
     await dbRun(env.DB, 'UPDATE users SET last_login = ? WHERE id = ?', nowIso(), orow.user_id);
     var user2 = await dbFirst(env.DB, 'SELECT * FROM users WHERE id = ?', orow.user_id);
     var hours2 = (ob.remember === true || ob.remember === 1 || ob.remember === '1') ? (7 * 24) : 2;
@@ -2032,6 +2181,19 @@ async function handleApi(request, env, url) {
     if (!timingSafeEqualStr(csrfHdr, me.csrf || '')) return deny('CSRF', 403);
   }
 
+  if (path === '/api/qr' && method === 'POST') {
+    if (me.role === 'viewer') return deny('Forbidden', 403);
+    var qb = await readJson(request) || {};
+    var qtext = String(qb.text || '').slice(0, 800);
+    if (!qtext) return deny('Empty', 400);
+    try {
+      var png = await qrPng(qtext, 4);
+      return new Response(png, { headers: { 'content-type': 'image/png', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
+    } catch (eQr) {
+      return deny('QR failed', 500);
+    }
+  }
+
   if (path === '/api/selfcheck' && method === 'GET') {
     if (me.role !== 'admin') return deny('Forbidden', 403);
     var ts = timingSafeEqualStr('ham', 'ham') && !timingSafeEqualStr('ham', 'hamx') && !timingSafeEqualStr('aa', 'bb');
@@ -2039,13 +2201,42 @@ async function handleApi(request, env, url) {
   }
 
   if (path === '/api/recovery' && method === 'POST') {
+    if (me.role !== 'admin') return deny('Forbidden', 403);
     var rb = await readJson(request) || {};
     var rc = normOtp(rb.code);
     if (rc.length !== 8) return deny('Recovery code must be 8 chars', 400);
+    var hadRec = !!(await settingGet(env.DB, 'recovery_hash'));
+    if (hadRec) {
+      var okRec = false;
+      var curP = String(rb.password || '');
+      if (curP) {
+        var fullU = await dbFirst(env.DB, 'SELECT * FROM users WHERE id = ?', me.id);
+        if (fullU) {
+          var hp = await hashPassword(curP, fromB64(fullU.salt));
+          if (timingSafeEqualStr(hp, fullU.password_hash)) okRec = true;
+        }
+      }
+      var oldC = normOtp(rb.current || '');
+      if (!okRec && oldC.length === 8) {
+        try {
+          var rh0 = await settingGet(env.DB, 'recovery_hash');
+          var rs0 = await settingGet(env.DB, 'recovery_salt');
+          if (rh0 && rs0) {
+            var recH0 = await hashPassword(oldC, fromB64(rs0));
+            if (timingSafeEqualStr(recH0, rh0)) okRec = true;
+          }
+        } catch (eRc) {}
+      }
+      if (!okRec) return deny('Current password or recovery code required', 403);
+    }
     var rSalt = crypto.getRandomValues(new Uint8Array(16));
     var rHash = await hashPassword(rc, rSalt);
     await settingSet(env.DB, 'recovery_salt', b64(rSalt));
     await settingSet(env.DB, 'recovery_hash', rHash);
+    try {
+      var curTok = getCookie(request, 'ham_sid') || '';
+      await dbRun(env.DB, 'DELETE FROM sessions WHERE user_id = ? AND token != ?', me.id, curTok);
+    } catch (eSess) {}
     return json({ ok: true });
   }
 
@@ -2105,9 +2296,9 @@ async function handleApi(request, env, url) {
       gip = String(list[gi] || '').trim();
       if (!gip) continue;
       try {
-        gr = await fetch('http://ip-api.com/json/' + encodeURIComponent(gip) + '?fields=status,country,countryCode', { method: 'GET' });
+        gr = await fetch('https://get.geojs.io/v1/ip/geo/' + encodeURIComponent(gip) + '.json', { method: 'GET' });
         gj = await gr.json();
-        if (gj && gj.status === 'success') geo[gip] = { cc: gj.countryCode || '', country: gj.country || '' };
+        if (gj && (gj.country || gj.country_code || gj.countryCode)) geo[gip] = { cc: gj.country_code || gj.countryCode || '', country: gj.country || '' };
         else geo[gip] = { cc: '', country: '?' };
       } catch (eG) {
         geo[gip] = { cc: '', country: '?' };
@@ -2155,31 +2346,19 @@ async function handleApi(request, env, url) {
       city: (request.cf && request.cf.city) || '',
       asOrg: (request.cf && request.cf.asOrganization) || ''
     };
-    try {
-      var alpeers = await dbAll(env.DB, 'SELECT * FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0 LIMIT 80');
-      var ap;
-      for (ap = 0; ap < alpeers.length; ap++) {
-        try { await maybeAlert(env, ctx, alpeers[ap], 'peer'); } catch (eAl) {}
-      }
-    } catch (eScan) {}
     var health = [];
     try {
-      var bhs = parseHostLines(await settingGet(env.DB, 'backup_hosts'));
-      var hi, hst, t0, hr;
-      for (hi = 0; hi < bhs.length && hi < 6; hi++) {
-        hst = bhs[hi];
-        t0 = Date.now();
-        try {
-          hr = await Promise.race([
-            fetch('https://' + hst + '/cdn-cgi/trace', { method: 'GET', redirect: 'manual' }),
-            new Promise(function (res) { setTimeout(function () { res(null); }, 2500); })
-          ]);
-          health.push({ host: hst, ok: !!(hr && (hr.status || 0) < 500), ms: Date.now() - t0 });
-        } catch (eH) {
-          health.push({ host: hst, ok: false, ms: Date.now() - t0 });
-        }
-      }
-    } catch (eHh) {}
+      var bhs = parseHostLines(await settingGet(env.DB, 'backup_hosts')).slice(0, 4);
+      health = await Promise.all(bhs.map(function (hst) {
+        var t0 = Date.now();
+        return Promise.race([
+          fetch('https://' + hst + '/cdn-cgi/trace', { method: 'GET', redirect: 'manual' }).then(function (hr) {
+            return { host: hst, ok: !!(hr && (hr.status || 0) < 500), ms: Date.now() - t0 };
+          }),
+          new Promise(function (res) { setTimeout(function () { res({ host: hst, ok: false, ms: Date.now() - t0 }); }, 800); })
+        ]).catch(function () { return { host: hst, ok: false, ms: Date.now() - t0 }; });
+      }));
+    } catch (eHh) { health = []; }
     try {
       var can = await settingGet(env.DB, 'canary');
       if (!can) await settingSet(env.DB, 'canary', randomToken());
@@ -2320,6 +2499,7 @@ async function handleApi(request, env, url) {
   }
 
   if (path === '/api/settings' && method === 'GET') {
+    if (me.role !== 'admin') return deny('Forbidden', 403);
     var portsOn = await enabledPorts(env.DB);
     var cfSaved = parsePortNums(await settingGet(env.DB, 'cf_ports'));
     if (!cfSaved.length) cfSaved = CF_ALL.slice();
@@ -2335,7 +2515,7 @@ async function handleApi(request, env, url) {
         camouflage_url: (await settingGet(env.DB, 'camouflage_url')) || 'https://ubuntu.com/',
         panel_path: (await settingGet(env.DB, 'panel_path')) || '/dash',
         cf_ports: cfSaved.join(','),
-        tg_token: await settingGet(env.DB, 'tg_token'),
+        tg_token_set: (await settingGet(env.DB, 'tg_token')) ? '1' : '0',
         tg_chat: await settingGet(env.DB, 'tg_chat'),
         bypass_fp: (await settingGet(env.DB, 'bypass_fp')) || 'chrome',
         bypass_ech: (await settingGet(env.DB, 'bypass_ech')) === '1' ? '1' : '0',
@@ -2403,16 +2583,17 @@ async function handleApi(request, env, url) {
     if (sb.tg_2fa === '1' || sb.tg_2fa === '0' || sb.tg_2fa === true || sb.tg_2fa === false) {
       await settingSet(env.DB, 'tg_2fa', sb.tg_2fa && sb.tg_2fa !== '0' ? '1' : '0');
     }
-    if (typeof sb.tg_token === 'string') await settingSet(env.DB, 'tg_token', sb.tg_token.trim());
+    if (typeof sb.tg_token === 'string' && sb.tg_token.trim()) await settingSet(env.DB, 'tg_token', sb.tg_token.trim());
     if (typeof sb.tg_chat === 'string') await settingSet(env.DB, 'tg_chat', sb.tg_chat.trim());
     /* cf_token removed from panel */
     var tokNow = await settingGet(env.DB, 'tg_token');
     if (tokNow) {
       try {
+        var hookSec = await ensureTgHookSecret(env.DB);
         await fetch('https://api.telegram.org/bot' + tokNow + '/setWebhook', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ url: url.origin + '/hamtg' })
+          body: JSON.stringify({ url: url.origin + '/hamtg', secret_token: hookSec })
         });
       } catch (e) {}
     }
@@ -2557,16 +2738,15 @@ async function handleApi(request, env, url) {
   }
 
   if (path === '/api/backup' && method === 'GET') {
+    if (me.role !== 'admin') return deny('Forbidden', 403);
     await ensureVpn(env.DB);
-    var bset = await dbAll(env.DB, 'SELECT key, value FROM settings');
-    var bpeers = await dbAll(env.DB, 'SELECT * FROM vpn_peers WHERE sub_id IS NULL OR sub_id = 0');
-    var bsubs = await dbAll(env.DB, 'SELECT * FROM vpn_subs');
-    var payload = JSON.stringify({ ham: 1, exported_at: nowIso(), settings: bset, peers: bpeers, subs: bsubs }, null, 2);
+    var payload = await packBackup(env.DB, true);
     return new Response(payload, {
       headers: {
         'content-type': 'application/json; charset=utf-8',
         'content-disposition': 'attachment; filename="ham-backup.json"',
-        'cache-control': 'no-store'
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff'
       }
     });
   }
@@ -2575,12 +2755,18 @@ async function handleApi(request, env, url) {
     if (me.role !== 'admin') return deny('Forbidden', 403);
     await ensureVpn(env.DB);
     var bk = await readJson(request);
+    if (bk && bk.ham === 1 && bk.enc) {
+      try {
+        var opened = await secretOpen(env.DB, bk.enc);
+        bk = JSON.parse(opened);
+      } catch (eOp) { return deny('Cannot open backup', 400); }
+    }
     if (!bk || bk.ham !== 1) return deny('Invalid backup', 400);
     var bi, row;
     if (Array.isArray(bk.settings)) {
       for (bi = 0; bi < bk.settings.length; bi++) {
         row = bk.settings[bi];
-        if (row && row.key) await settingSet(env.DB, String(row.key), String(row.value == null ? '' : row.value));
+        if (row && row.key && !BACKUP_SKIP[row.key]) await settingSet(env.DB, String(row.key), String(row.value == null ? '' : row.value));
       }
     }
     if (Array.isArray(bk.peers)) {
@@ -3053,8 +3239,15 @@ async function handleSub(request, env, url) {
   }
   var remark = subInfoRemark(sub, legacyPeers);
   if (blocked) { pack.lines = []; pack.clash = []; pack.count = 0; }
-  if (!blocked && Number(sub.one_shot) && !Number(sub.burned) && request.method === 'GET') {
-    try { await dbRun(env.DB, 'UPDATE vpn_subs SET burned = 1 WHERE id = ?', sub.id); } catch (eb) {}
+  if (Number(sub.one_shot) && request.method === 'GET') {
+    if (Number(sub.burned)) blocked = true;
+    else {
+      try {
+        var burnRes = await dbRun(env.DB, 'UPDATE vpn_subs SET burned = 1 WHERE id = ? AND burned = 0', sub.id);
+        var chg = burnRes && burnRes.meta ? (Number(burnRes.meta.changes) || Number(burnRes.meta.rows_written) || 0) : 0;
+        if (!chg) blocked = true;
+      } catch (eb) { blocked = true; }
+    }
   }
   var lines = [infoVless(remark)].concat(pack.lines);
   var body = lines.join('\n');
@@ -3129,14 +3322,239 @@ async function tgApi(token, method, payload) {
   } catch (e) { return { ok: false }; }
 }
 
+
+function qrGf() {
+  var exp = new Uint8Array(512), log = new Uint8Array(256), x = 1, i;
+  for (i = 0; i < 255; i++) { exp[i] = x; log[x] = i; x <<= 1; if (x & 256) x ^= 285; }
+  for (i = 255; i < 512; i++) exp[i] = exp[i - 255];
+  return { exp: exp, log: log };
+}
+var QG = qrGf();
+function qrMul(a, b) { return a && b ? QG.exp[QG.log[a] + QG.log[b]] : 0; }
+function qrGenPoly(n) {
+  var g = [1], i, j, ng;
+  for (i = 0; i < n; i++) {
+    ng = [];
+    for (j = 0; j < g.length; j++) {
+      ng[j] = (ng[j] || 0) ^ qrMul(g[j], QG.exp[i]);
+      ng[j + 1] = (ng[j + 1] || 0) ^ g[j];
+    }
+    g = ng;
+  }
+  return g;
+}
+function qrRs(data, nsym) {
+  var gen = qrGenPoly(nsym);
+  var out = new Uint8Array(nsym);
+  var i, j, coef;
+  for (i = 0; i < data.length; i++) {
+    coef = data[i] ^ out[0];
+    for (j = 0; j < nsym - 1; j++) out[j] = out[j + 1] ^ qrMul(gen[j + 1], coef);
+    out[nsym - 1] = qrMul(gen[nsym], coef);
+  }
+  return out;
+}
+var QR_ALIGN = {
+  2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],9:[6,26,46],10:[6,28,50],
+  11:[6,30,54],12:[6,32,58],13:[6,34,62],14:[6,26,46,66],15:[6,26,48,70],16:[6,26,50,74]
+};
+var QR_L = {
+  1:[19,7,1],2:[34,10,1],3:[55,15,1],4:[80,20,1],5:[108,26,1],6:[136,18,2],7:[156,20,2],
+  8:[194,24,2],9:[232,30,2],10:[271,18,4],11:[321,20,4],12:[367,24,4],13:[425,26,4],14:[458,30,4],15:[520,22,6]
+};
+function qrBits(str, ver) {
+  var bytes = new TextEncoder().encode(str);
+  var cap = QR_L[ver][0];
+  var bits = [];
+  function put(v, n) { var i; for (i = n - 1; i >= 0; i--) bits.push((v >> i) & 1); }
+  put(4, 4);
+  put(bytes.length, ver < 10 ? 8 : 16);
+  var i, b, j;
+  for (i = 0; i < bytes.length; i++) put(bytes[i], 8);
+  var total = cap * 8;
+  put(0, Math.min(4, total - bits.length));
+  while (bits.length % 8) bits.push(0);
+  var pad = [0xec, 0x11], p = 0;
+  while (bits.length < total) put(pad[p++ % 2], 8);
+  var data = new Uint8Array(cap);
+  for (i = 0; i < cap; i++) {
+    b = 0;
+    for (j = 0; j < 8; j++) b = (b << 1) | bits[i * 8 + j];
+    data[i] = b;
+  }
+  return data;
+}
+function qrInterleave(data, ver) {
+  var spec = QR_L[ver];
+  var nblocks = spec[2], ec = spec[1], cap = spec[0];
+  var base = Math.floor(cap / nblocks);
+  var extra = cap % nblocks;
+  var blocks = [], ecs = [], i, off = 0, sz, blk;
+  for (i = 0; i < nblocks; i++) {
+    sz = base + (i >= nblocks - extra ? 1 : 0);
+    blk = data.slice(off, off + sz);
+    off += sz;
+    blocks.push(blk);
+    ecs.push(qrRs(blk, ec));
+  }
+  var out = [], r, c, maxd = base + (extra ? 1 : 0);
+  for (c = 0; c < maxd; c++) for (r = 0; r < nblocks; r++) if (c < blocks[r].length) out.push(blocks[r][c]);
+  for (c = 0; c < ec; c++) for (r = 0; r < nblocks; r++) out.push(ecs[r][c]);
+  return out;
+}
+function qrPlace(ver, code) {
+  var n = ver * 4 + 17;
+  var m = [];
+  var r, c, i;
+  for (r = 0; r < n; r++) { m[r] = []; for (c = 0; c < n; c++) m[r][c] = null; }
+  function finder(x, y) {
+    var a, b, d;
+    for (a = -1; a <= 7; a++) for (b = -1; b <= 7; b++) {
+      var xx = x + b, yy = y + a;
+      if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue;
+      d = Math.max(Math.abs(a - 3), Math.abs(b - 3));
+      m[yy][xx] = d !== 2 && d !== 4 ? 1 : 0;
+    }
+  }
+  finder(0, 0); finder(n - 7, 0); finder(0, n - 7);
+  var al = QR_ALIGN[ver] || [];
+  function isFinder(x, y) {
+    return (x < 9 && y < 9) || (x >= n - 8 && y < 9) || (x < 9 && y >= n - 8);
+  }
+  for (r = 0; r < al.length; r++) for (c = 0; c < al.length; c++) {
+    var ax = al[c], ay = al[r];
+    if (isFinder(ax, ay)) continue;
+    var a, b, d;
+    for (a = -2; a <= 2; a++) for (b = -2; b <= 2; b++) {
+      d = Math.max(Math.abs(a), Math.abs(b));
+      m[ay + a][ax + b] = d === 1 ? 0 : 1;
+    }
+  }
+  for (i = 8; i < n - 8; i++) { if (m[6][i] == null) m[6][i] = i % 2 === 0 ? 1 : 0; if (m[i][6] == null) m[i][6] = i % 2 === 0 ? 1 : 0; }
+  m[n - 8][8] = 1;
+  var bit = 0, len = code.length * 8, dir = -1, col = n - 1;
+  function bitAt(k) { return (code[k >> 3] >> (7 - (k & 7))) & 1; }
+  while (col > 0) {
+    if (col === 6) col--;
+    for (r = 0; r < n; r++) {
+      var y = dir < 0 ? n - 1 - r : r;
+      for (c = 0; c < 2; c++) {
+        var x = col - c;
+        if (m[y][x] != null) continue;
+        var v = bit < len ? bitAt(bit) : 0;
+        if (((x + y) & 1) === 0) v ^= 1;
+        m[y][x] = v;
+        bit++;
+      }
+    }
+    dir = -dir;
+    col -= 2;
+  }
+  var fmt = 0x77c4;
+  var fbits = [];
+  for (i = 0; i < 15; i++) fbits.push((fmt >> i) & 1);
+  var fmap = [[0,8],[1,8],[2,8],[3,8],[4,8],[5,8],[7,8],[8,8],[8,7],[8,5],[8,4],[8,3],[8,2],[8,1],[8,0]];
+  var fmap2 = [[8,n-1],[8,n-2],[8,n-3],[8,n-4],[8,n-5],[8,n-6],[8,n-7],[8,n-8],[n-8,8],[n-7,8],[n-6,8],[n-5,8],[n-4,8],[n-3,8],[n-2,8]];
+  for (i = 0; i < 15; i++) { m[fmap[i][1]][fmap[i][0]] = fbits[i]; m[fmap2[i][1]][fmap2[i][0]] = fbits[i]; }
+  if (ver >= 7) {
+    var vb = ver << 12;
+    var poly = 0x1f25;
+    var d = vb;
+    for (i = 17; i >= 12; i--) if ((d >> i) & 1) d ^= poly << (i - 12);
+    vb ^= d;
+    for (i = 0; i < 18; i++) {
+      var vv = (vb >> i) & 1;
+      m[Math.floor(i / 3)][n - 11 + (i % 3)] = vv;
+      m[n - 11 + (i % 3)][Math.floor(i / 3)] = vv;
+    }
+  }
+  return m;
+}
+function qrMake(str) {
+  str = String(str || '');
+  var bytes = new TextEncoder().encode(str);
+  var ver, spec, need = bytes.length + (10 <= 9 ? 2 : 3) + 1;
+  for (ver = 2; ver <= 15; ver++) {
+    spec = QR_L[ver];
+    var hdr = ver < 10 ? 2 : 3;
+    if (bytes.length + hdr + 1 <= spec[0]) break;
+  }
+  if (ver > 15) ver = 15;
+  var data = qrBits(str, ver);
+  var code = qrInterleave(data, ver);
+  return qrPlace(ver, code);
+}
+function crc32(u8) {
+  var c = 0xffffffff, i, k, b;
+  for (i = 0; i < u8.length; i++) {
+    b = u8[i];
+    c ^= b;
+    for (k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+function u32be(n) { return new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]); }
+function pngChunk(type, data) {
+  var t = new TextEncoder().encode(type);
+  var len = u32be(data.length);
+  var body = new Uint8Array(t.length + data.length);
+  body.set(t, 0); body.set(data, t.length);
+  var crc = u32be(crc32(body));
+  var out = new Uint8Array(4 + body.length + 4);
+  out.set(len, 0); out.set(body, 4); out.set(crc, 4 + body.length);
+  return out;
+}
+async function qrPng(text, scale) {
+  scale = scale || 4;
+  var m = qrMake(text);
+  var n = m.length, pad = 4, dim = (n + pad * 2) * scale;
+  var raw = new Uint8Array((dim + 1) * dim);
+  var y, x, sy, sx, yy, xx, v, row;
+  for (y = 0; y < dim; y++) {
+    raw[y * (dim + 1)] = 0;
+    yy = Math.floor(y / scale) - pad;
+    for (x = 0; x < dim; x++) {
+      xx = Math.floor(x / scale) - pad;
+      v = (yy >= 0 && xx >= 0 && yy < n && xx < n) ? m[yy][xx] : 0;
+      raw[y * (dim + 1) + 1 + x] = v ? 0 : 255;
+    }
+  }
+  var cs = new CompressionStream('deflate');
+  var w = cs.writable.getWriter();
+  await w.write(raw);
+  await w.close();
+  var r = cs.readable.getReader();
+  var chunks = [], tot = 0, ch;
+  while (1) {
+    ch = await r.read();
+    if (ch.done) break;
+    chunks.push(new Uint8Array(ch.value));
+    tot += ch.value.byteLength || ch.value.length;
+  }
+  var idat = new Uint8Array(tot), o = 0;
+  for (x = 0; x < chunks.length; x++) { idat.set(chunks[x], o); o += chunks[x].length; }
+  var ihdr = new Uint8Array(13);
+  ihdr.set(u32be(dim), 0); ihdr.set(u32be(dim), 4); ihdr[8] = 8; ihdr[9] = 0;
+  var sig = new Uint8Array([137,80,78,71,13,10,26,10]);
+  var c1 = pngChunk('IHDR', ihdr);
+  var c2 = pngChunk('IDAT', idat);
+  var c3 = pngChunk('IEND', new Uint8Array(0));
+  var out = new Uint8Array(sig.length + c1.length + c2.length + c3.length);
+  out.set(sig, 0); out.set(c1, sig.length); out.set(c2, sig.length + c1.length); out.set(c3, sig.length + c1.length + c2.length);
+  return out;
+}
+
 async function tgSendQr(token, chatId, link, caption) {
-  var qr = 'https://api.qrserver.com/v1/create-qr-code/?size=320x320&ecc=M&margin=8&data=' + encodeURIComponent(link);
-  await tgApi(token, 'sendPhoto', {
-    chat_id: chatId,
-    photo: qr,
-    caption: String(caption || '').slice(0, 1024),
-    reply_markup: tgMenu()
-  });
+  try {
+    var png = await qrPng(String(link || ''), 4);
+    var fd = new FormData();
+    fd.append('chat_id', String(chatId));
+    fd.append('caption', String(caption || '').slice(0, 1024));
+    fd.append('photo', new Blob([png], { type: 'image/png' }), 'qr.png');
+    await fetch('https://api.telegram.org/bot' + token + '/sendPhoto', { method: 'POST', body: fd });
+  } catch (eQ) {
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: String(caption || link || '').slice(0, 3500), reply_markup: tgMenu() });
+  }
 }
 
 function tgMenu() {
@@ -3258,6 +3676,12 @@ function tgRemainText(row, kind) {
 async function handleTelegram(request, env, url) {
   if (request.method === 'GET' || request.method === 'HEAD') return json({ ok: true, hook: 'hamtg' });
   if (!hasDB(env)) return json({ ok: true });
+  var hookWant = '';
+  try { hookWant = await settingGet(env.DB, 'tg_hook_secret'); } catch (eHk) {}
+  if (hookWant) {
+    var hookGot = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+    if (!timingSafeEqualStr(hookGot, hookWant)) return json({ ok: true });
+  }
   var token = await settingGet(env.DB, 'tg_token');
   if (!token) return json({ ok: true });
   var body = await readJson(request);
@@ -3693,9 +4117,12 @@ async function handleTelegram(request, env, url) {
 async function handleStatus(request, env, url) {
   if (!hasDB(env)) return new Response('no db', { status: 500 });
   await ensureVpn(env.DB);
-  var token = url.pathname.split('/').filter(Boolean)[1] || '';
+  var partsSt = url.pathname.split('/').filter(Boolean);
+  var token = partsSt[1] || '';
+  var passIn = partsSt[2] || url.searchParams.get('p') || '';
   var sub = await dbFirst(env.DB, 'SELECT * FROM vpn_subs WHERE token = ?', token);
   if (!sub) return new Response('not found', { status: 404 });
+  if (sub.sub_pass && String(sub.sub_pass) !== String(passIn)) return new Response('password', { status: 401 });
   var q = Number(sub.quota_bytes) || 0;
   var u = Number(sub.used_bytes) || 0;
   var left = q > 0 ? Math.max(0, q - u) : 0;
@@ -3727,7 +4154,7 @@ async function handleCron(env, ctx) {
   for (ai = 0; ai < peers.length; ai++) {
     try { await maybeAlert(env, ctx, peers[ai], 'peer'); } catch (eA) {}
   }
-  var payload = JSON.stringify({ ham: 1, exported_at: nowIso(), peers: peers, subs: subs });
+  var payload = await packBackup(env.DB, true);
   try {
     var fd = new FormData();
     fd.append('chat_id', chat);
@@ -3760,14 +4187,18 @@ async function handleRequest(request, env, ctx) {
     }
   }
   var panel = '/dash';
-  var camouflage = 'https://ubuntu.com/';
+  var camouflage = CAMO_URL;
   if (hasDB(env)) {
     try {
-      var pp = await settingGet(env.DB, 'panel_path');
-      if (pp) panel = normPath(pp);
-      var cu = await settingGet(env.DB, 'camouflage_url');
-      if (cu && /^https?:\/\//.test(cu)) camouflage = cu;
-      else camouflage = CAMO_URL;
+      if (!PANEL_MEM.t || Date.now() - PANEL_MEM.t > 30000) {
+        var pp = await settingGet(env.DB, 'panel_path');
+        var cu = await settingGet(env.DB, 'camouflage_url');
+        PANEL_MEM.path = pp ? normPath(pp) : '/dash';
+        PANEL_MEM.camo = (cu && /^https?:\/\//.test(cu)) ? cu : CAMO_URL;
+        PANEL_MEM.t = Date.now();
+      }
+      panel = PANEL_MEM.path || '/dash';
+      camouflage = PANEL_MEM.camo || CAMO_URL;
     } catch (e) {}
   }
   if (url.pathname.indexOf('/sub/') === 0) {
@@ -3800,6 +4231,8 @@ async function handleRequest(request, env, ctx) {
         'x-content-type-options': 'nosniff',
         'referrer-policy': 'same-origin',
         'x-frame-options': 'DENY',
+        'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+        'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com data:; img-src 'self' data: https:; connect-src 'self' https:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
         'cache-control': 'no-store'
       }
     });
@@ -3816,7 +4249,7 @@ const HTML = String.raw`<!DOCTYPE html>
 <link rel="icon" type="image/png" href="data:image/png;base64,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">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
 <style>
 :root,html[data-theme="light"]{
   --bg:#eef1f7; --bg2:#e3e8f2; --card:#ffffff; --card2:#f5f7fc;
@@ -4327,6 +4760,19 @@ function toast(msg, bad){
   setTimeout(function(){ n.remove(); }, 3200);
 }
 var BASE = location.pathname; while (BASE.length > 1 && BASE.charAt(BASE.length-1)==='/') BASE = BASE.slice(0,-1); if (!BASE) BASE = '/dash';
+function paintQr(){
+  document.querySelectorAll('[data-q]').forEach(function(el){
+    var text = el.getAttribute('data-q');
+    if (!text || el.getAttribute('data-qr-ok')) return;
+    el.setAttribute('data-qr-ok', '1');
+    var o = { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } };
+    if (S.csrf) o.headers['X-CSRF-Token'] = S.csrf;
+    o.body = JSON.stringify({ text: text });
+    fetch(BASE + '/api/qr', o).then(function(r){ if (!r.ok) throw new Error('qr'); return r.blob(); }).then(function(b){
+      el.src = URL.createObjectURL(b);
+    }).catch(function(){});
+  });
+}
 function api(path, method, body){
   var opt = { method: method || 'GET', credentials: 'same-origin', headers: {} };
   if (S.csrf) opt.headers['X-CSRF-Token'] = S.csrf;
@@ -4866,7 +5312,7 @@ function viewVpn(){
         '<div class="muted" style="font-size:12px;margin-top:6px">', esc(pr.used_h), ' / ', esc(pr.quota_h), ' · ', esc(exp), '</div></div>',
         pr.alive ? '<span class="pill ok">' + esc(t('vpn_on')) + '</span>' : '<span class="pill bad">' + esc(t('vpn_off')) + '</span>',
         '</div>',
-        vless ? h('<div class="row" style="align-items:flex-start;gap:10px;margin-top:10px"><div class="linkbox" style="flex:1">', esc(vless), '</div><img alt="QR" width="96" height="96" style="border-radius:8px;background:#fff;flex:none" src="https://api.qrserver.com/v1/create-qr-code/?size=96x96&ecc=M&margin=4&data=', encodeURIComponent(vless), '"></div>') : '',
+        vless ? h('<div class="row" style="align-items:flex-start;gap:10px;margin-top:10px"><div class="linkbox" style="flex:1">', esc(vless), '</div><img alt="QR" width="96" height="96" style="border-radius:8px;background:#fff;flex:none" class="qr-cv" width="96" height="96" data-q="', esc(vless), '"></div>') : '',
         '<div class="row">',
         vless ? h('<button class="btn primary" data-act="vpn-copy" data-link="', esc(vless), '">', esc(t('share')), '</button>') : '',
         vless ? h('<button class="btn" data-act="vpn-copy" data-link="', esc(vless), '">VLESS</button>') : '',
@@ -4891,6 +5337,7 @@ function viewVpn(){
       '<div id="modal"></div>'
     ));
     startVpnAlivePoll();
+    paintQr();
   });
 }
 
@@ -5216,7 +5663,7 @@ function viewSettings(){
       '<h3 style="margin:8px 0 12px">', esc(t('tg')), '</h3>',
       '<p class="hint">', esc(t('tg_h')), '</p>',
       '<p class="hint">', esc(t('tg_bot')), '</p>',
-      '<div class="field"><label>', esc(t('tg_token')), '</label><input class="input" name="tg_token" value="', esc(s.tg_token || ''), '"></div>',
+      '<div class="field"><label>', esc(t('tg_token')), '</label><input class="input" name="tg_token" value="" placeholder="', esc(s.tg_token_set === '1' ? '••••' : ''), '" autocomplete="off"></div>',
       '<div class="field"><label>', esc(t('tg_chat')), '</label><input class="input" name="tg_chat" value="', esc(s.tg_chat || ''), '"></div>',
       '<div class="field"><label>', esc(t('email')), '</label><input class="input" name="admin_email" type="email" value="" placeholder="', esc(s.has_email || s.admin_email_set ? '••••' : ''), '"><div class="hint">', esc(t('email_need')), '</div></div>',
       '<div class="row" style="margin-bottom:12px"><button class="btn" type="button" data-act="email-chg">', esc(t('email')), '</button></div>',
@@ -5582,11 +6029,12 @@ document.getElementById('app').addEventListener('click', function(e){
     qel.innerHTML = h(
       '<div class="modalbg" data-act="modal-close"><div class="card modal" style="text-align:center;max-width:320px">',
       '<h3 style="margin-bottom:10px">', esc(t('qr')), '</h3>',
-      '<img class="qr" style="width:240px;height:240px;margin:8px auto;display:block" alt="QR" src="', esc('https://api.qrserver.com/v1/create-qr-code/?size=280x280&ecc=M&margin=8&data=' + encodeURIComponent(qlink)), '">',
+      '<img class="qr qr-cv" style="width:240px;height:240px;margin:8px auto;display:block" alt="QR" data-q="', esc(qlink), '">',
       '<div class="row" style="margin-top:10px;justify-content:center">',
       '<button class="btn" type="button" data-act="modal-close">', esc(t('cancel')), '</button>',
       '</div></div></div>'
     );
+    paintQr();
     return;
   }
   if (act === 'vpn-tog'){
@@ -5795,7 +6243,7 @@ document.getElementById('app').addEventListener('submit', function(e){
     if (fd.get('abuse_gb') != null) payload.abuse_gb = fd.get('abuse_gb') || '0';
     if (f.querySelector('[name=access_only]')) payload.access_only = f.querySelector('[name=access_only]').checked ? '1' : '0';
     if (f.querySelector('[name=cf_port]')) payload.cf_ports = pickedPorts(f, 'cf_port').join(',');
-    if (fd.get('tg_token') != null) payload.tg_token = fd.get('tg_token');
+    if (fd.get('tg_token') != null && String(fd.get('tg_token') || '').trim()) payload.tg_token = fd.get('tg_token').trim();
     if (fd.get('tg_chat') != null) payload.tg_chat = fd.get('tg_chat');
     /* no cf_token */
     if (fd.get('admin_email') != null && String(fd.get('admin_email') || '').trim()) payload.admin_email_new = fd.get('admin_email');
@@ -5855,9 +6303,9 @@ export default {
       return await handleRequest(request, env, ctx);
     } catch (e) {
       var msg = String((e && e.stack) || (e && e.message) || e);
-      return new Response('Ham error\n' + msg, {
+      return new Response('Ham error', {
         status: 500,
-        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }
       });
     }
   },
